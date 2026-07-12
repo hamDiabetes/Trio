@@ -64,17 +64,124 @@ extension TrioRemoteControl {
             fpuID: fatDecimal ?? 0 > 0 || proteinDecimal ?? 0 > 0 ? UUID().uuidString : nil
         )
 
+        // Resolve any follow-up bolus before storing the meal so the recommendation is not skewed by the
+        // just-stored carbs, matching the Treatments UI's compute-then-save order.
+        let bolusPlan = await resolveMealBolusPlan(payload, carbs: carbsDecimal ?? 0, mealDate: actualDate)
+
         try await carbsStorage.storeCarbs([mealEntry], areFetchedFromRemote: false)
 
-        if payload.bolusAmount != nil {
+        switch bolusPlan {
+        case .none:
+            await logSuccess(
+                "Remote command processed successfully. \(payload.humanReadableDescription())",
+                payload: payload,
+                customNotificationMessage: "Meal logged"
+            )
+
+        case .explicit:
             try await handleBolusCommand(payload)
-            return
+
+        case let .reject(reason):
+            await logError(reason, payload: payload)
+
+        case let .skip(reason):
+            await logSuccess(reason, payload: payload, customNotificationMessage: reason, uploadNote: true)
+
+        case let .recommended(amount):
+            do {
+                try await enactValidatedBolus(
+                    amount: amount,
+                    payload: payload,
+                    successNotificationMessage: "Auto-bolus started: \(amount) U"
+                )
+            } catch {
+                await logError(
+                    "Auto-bolus failed after the meal was stored: \(error.localizedDescription). The meal was logged, but no insulin was delivered by this command.",
+                    payload: payload
+                )
+            }
+        }
+    }
+
+    private enum MealBolusPlan {
+        case none
+        case explicit
+        case reject(String)
+        case skip(String)
+        case recommended(Decimal)
+    }
+
+    // Only a meal timed for roughly now is bolused; an upfront bolus for future or backdated carbs would
+    // over-deliver once the loop accounts for them.
+    private enum AutoBolusMealScheduling {
+        static let futureTolerance: TimeInterval = 10 * 60
+        static let pastTolerance: TimeInterval = 10 * 60
+    }
+
+    private func resolveMealBolusPlan(_ payload: CommandPayload, carbs: Decimal, mealDate: Date?) async -> MealBolusPlan {
+        let wantsRecommendedBolus = payload.useRecommendedBolus == true
+        let hasExplicitBolus = payload.bolusAmount != nil
+
+        if hasExplicitBolus, wantsRecommendedBolus {
+            return .reject(
+                "Command rejected: a meal cannot request both an explicit bolus amount and Trio's recommended bolus. The meal was logged, but no bolus was given."
+            )
+        }
+        if hasExplicitBolus {
+            return .explicit
+        }
+        guard wantsRecommendedBolus else {
+            return .none
         }
 
-        await logSuccess(
-            "Remote command processed successfully. \(payload.humanReadableDescription())",
-            payload: payload,
-            customNotificationMessage: "Meal logged"
+        guard UserDefaults.standard.bool(forKey: "isRemoteMealAutoBolusEnabled") else {
+            return .skip(
+                "The meal was logged. Auto-bolus was not given because \"Auto-bolus for Remote Meals\" is disabled in Trio's Remote Control settings."
+            )
+        }
+
+        let now = Date()
+        let mealTime = mealDate ?? now
+        let offset = mealTime.timeIntervalSince(now)
+
+        if offset > AutoBolusMealScheduling.futureTolerance {
+            return .skip(
+                "The meal was logged. Auto-bolus was skipped because the meal is scheduled in the future; enact a bolus when the meal is eaten."
+            )
+        }
+        if offset < -AutoBolusMealScheduling.pastTolerance {
+            return .skip(
+                "The meal was logged. Auto-bolus was skipped because the meal is backdated; the loop is already accounting for these carbs, so no upfront bolus was given."
+            )
+        }
+
+        guard let apsManager = await TrioApp.resolver.resolve(APSManager.self),
+              let bolusCalculationManager = await TrioApp.resolver.resolve(BolusCalculationManager.self)
+        else {
+            return .reject(
+                "Error: unable to compute the recommended bolus because required services are not available. The meal was logged, but no bolus was given."
+            )
+        }
+
+        let result = await bolusCalculationManager.handleBolusCalculation(
+            carbs: carbs,
+            useFattyMealCorrection: false,
+            useSuperBolus: false,
+            lastLoopDate: apsManager.lastLoopDate,
+            minPredBG: nil,
+            simulatedCOB: nil,
+            isBackdated: false
         )
+
+        // insulinCalculated is already safety-clamped (to 0 below limits, stale loop, or IOB cap) and rounded
+        // to the pump increment.
+        let recommendedBolus = result.insulinCalculated
+        guard recommendedBolus > 0 else {
+            return .skip(
+                "The meal was logged. Auto-bolus recommended no insulin for this meal. This is expected when glucose or a prediction is below the safety limit, the loop is stale, or IOB is already at its limit."
+            )
+        }
+
+        return .recommended(recommendedBolus)
     }
 }
