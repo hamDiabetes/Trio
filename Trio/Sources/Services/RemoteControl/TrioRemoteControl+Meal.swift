@@ -90,6 +90,16 @@ extension TrioRemoteControl {
         case let .skip(reason):
             await logSuccess(reason, payload: payload, customNotificationMessage: reason, uploadNote: true)
 
+        case let .advise(amount):
+            let message = "Recommended bolus: \(amount) U for \(carbsDecimal ?? 0) g. Review and confirm in Loop Follow."
+            await logSuccess(
+                message,
+                payload: payload,
+                customNotificationMessage: message,
+                uploadNote: true,
+                recommendedBolus: amount
+            )
+
         case let .recommended(amount):
             do {
                 try await enactValidatedBolus(
@@ -111,6 +121,7 @@ extension TrioRemoteControl {
         case explicit
         case reject(String)
         case skip(String)
+        case advise(Decimal)
         case recommended(Decimal)
     }
 
@@ -137,9 +148,10 @@ extension TrioRemoteControl {
             return .none
         }
 
-        guard UserDefaults.standard.bool(forKey: "isRemoteMealAutoBolusEnabled") else {
+        let mode = RemoteMealBolusMode.current()
+        guard mode != .off else {
             return .skip(
-                "The meal was logged. Auto-bolus was not given because \"Auto-bolus for Remote Meals\" is disabled in Trio's Remote Control settings."
+                "The meal was logged. No bolus was given because Remote Meal Bolus is set to Off in Trio's Remote Control settings."
             )
         }
 
@@ -185,6 +197,6 @@ extension TrioRemoteControl {
             )
         }
 
-        return .recommended(recommendedBolus)
+        return mode == .requireReview ? .advise(recommendedBolus) : .recommended(recommendedBolus)
     }
 }
