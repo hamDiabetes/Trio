@@ -75,6 +75,7 @@ extension Treatments {
 
         var fraction: Decimal = 0
         var basal: Decimal = 0
+        var prefillRecommendedBolus: Bool = false
         var fattyMeals: Bool = false
         var fattyMealFactor: Decimal = 0
         var useFattyMealCorrectionFactor: Bool = false
@@ -355,6 +356,7 @@ extension Treatments {
             units = settingsManager.settings.units
             fraction = settings.settings.overrideFactor
             dosingMode = settings.settings.dosingMode
+            prefillRecommendedBolus = settings.settings.prefillRecommendedBolus
             fattyMeals = settings.settings.fattyMeals
             fattyMealFactor = settings.settings.fattyMealFactor
             sweetMeals = settings.settings.sweetMeals
