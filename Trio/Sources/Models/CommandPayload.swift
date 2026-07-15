@@ -135,3 +135,34 @@ extension TrioRemoteControl {
         }
     }
 }
+
+enum RemoteMealBolusMode: String, CaseIterable, Identifiable {
+    case off
+    case requireReview
+    case auto
+
+    var id: String { rawValue }
+
+    static let storageKey = "remoteMealBolusMode"
+
+    // Legacy boolean key; true meant auto-bolus was enabled.
+    private static let legacyEnabledKey = "isRemoteMealAutoBolusEnabled"
+
+    static func current(from defaults: UserDefaults = .standard) -> RemoteMealBolusMode {
+        if let raw = defaults.string(forKey: storageKey), let mode = RemoteMealBolusMode(rawValue: raw) {
+            return mode
+        }
+        return defaults.bool(forKey: legacyEnabledKey) ? .auto : .off
+    }
+
+    var displayName: String {
+        switch self {
+        case .off:
+            return String(localized: "Off")
+        case .requireReview:
+            return String(localized: "Require Review")
+        case .auto:
+            return String(localized: "Auto")
+        }
+    }
+}
