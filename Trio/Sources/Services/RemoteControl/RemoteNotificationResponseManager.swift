@@ -3,6 +3,8 @@ import Foundation
 class RemoteNotificationResponseManager {
     static let shared = RemoteNotificationResponseManager()
 
+    static let recommendedBolusCategoryIdentifier = "TRIO_RECOMMENDED_BOLUS"
+
     private init() {}
 
     struct NotificationPayload: Encodable {
@@ -10,18 +12,21 @@ class RemoteNotificationResponseManager {
         let commandStatus: String
         let commandType: String
         let timestamp: TimeInterval
+        let recommendedBolus: Decimal?
 
         enum CodingKeys: String, CodingKey {
             case aps
             case commandStatus = "command_status"
             case commandType = "command_type"
             case timestamp
+            case recommendedBolus = "recommended_bolus"
         }
     }
 
     struct APSPayload: Encodable {
         let alert: Alert
         let sound: String = "default"
+        let category: String?
     }
 
     struct Alert: Encodable {
@@ -33,7 +38,8 @@ class RemoteNotificationResponseManager {
         to returnInfo: CommandPayload.ReturnNotificationInfo?,
         commandType: TrioRemoteControl.CommandType,
         success: Bool,
-        message: String
+        message: String,
+        recommendedBolus: Decimal? = nil
     ) async {
         guard let returnInfo = returnInfo,
               !returnInfo.deviceToken.isEmpty
@@ -47,11 +53,13 @@ class RemoteNotificationResponseManager {
                 alert: Alert(
                     title: success ? "Command Successful" : "Command Failed",
                     body: message
-                )
+                ),
+                category: recommendedBolus != nil ? Self.recommendedBolusCategoryIdentifier : nil
             ),
             commandStatus: success ? "success" : "failed",
             commandType: commandType.rawValue,
-            timestamp: Date().timeIntervalSince1970
+            timestamp: Date().timeIntervalSince1970,
+            recommendedBolus: recommendedBolus
         )
 
         await sendPushNotification(
