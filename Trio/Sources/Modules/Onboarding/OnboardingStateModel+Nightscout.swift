@@ -66,98 +66,15 @@ extension Onboarding.StateModel {
                 )
             }
 
-            // determine, i.e. guesstimate, whether fetched values are mmol/L or mg/dL values
-            let shouldConvertToMgdL = fetchedProfile.units.contains("mmol") || fetchedProfile.target_low
-                .contains(where: { $0.value <= 39 }) || fetchedProfile.target_high.contains(where: { $0.value <= 39 })
-
-            // Carb Ratios
-            let carbratios = fetchedProfile.carbratio.map { carbratio in
-                CarbRatioEntry(
-                    start: carbratio.time,
-                    offset: offset(carbratio.time) / 60,
-                    ratio: carbratio.value
-                )
-            }
-
-            if carbratios.contains(where: { $0.ratio <= 0 }) {
-                throw NSError(
-                    domain: "ImportError",
-                    code: 2,
-                    userInfo: [NSLocalizedDescriptionKey: "Invalid Carb Ratio settings in Nightscout. Import aborted."]
-                )
-            }
-
-            let carbratiosProfile = CarbRatios(units: .grams, schedule: carbratios)
-
-            // Basal Profile
-            let basals = fetchedProfile.basal.map { basal in
-                BasalProfileEntry(
-                    start: basal.time,
-                    minutes: offset(basal.time) / 60,
-                    rate: basal.value
-                )
-            }
-
-            if basals.contains(where: { $0.rate <= 0 }) {
-                throw NSError(
-                    domain: "ImportError",
-                    code: 3,
-                    userInfo: [NSLocalizedDescriptionKey: "Invalid Nightscout basal rates found. Import aborted."]
-                )
-            }
-
-            if basals.reduce(0, { $0 + $1.rate }) <= 0 {
-                throw NSError(
-                    domain: "ImportError",
-                    code: 4,
-                    userInfo: [
-                        NSLocalizedDescriptionKey: "Invalid Nightscout basal rates found. Basal rate total cannot be 0 U/hr. Import aborted."
-                    ]
-                )
-            }
-
-            // Sensitivities
-            let sensitivities = fetchedProfile.sens.map { sensitivity in
-                InsulinSensitivityEntry(
-                    sensitivity: shouldConvertToMgdL ? sensitivity.value.asMgdL : sensitivity.value,
-                    offset: offset(sensitivity.time) / 60,
-                    start: sensitivity.time
-                )
-            }
-
-            if sensitivities.contains(where: { $0.sensitivity <= 0 }) {
-                throw NSError(
-                    domain: "ImportError",
-                    code: 5,
-                    userInfo: [NSLocalizedDescriptionKey: "Invalid Nightscout insulin sensitivity profile. Import aborted."]
-                )
-            }
-
-            let sensitivitiesProfile = InsulinSensitivities(
-                units: .mgdL,
-                userPreferredUnits: .mgdL,
-                sensitivities: sensitivities
-            )
-
-            // Targets
-            let targets = fetchedProfile.target_low.map { target in
-                BGTargetEntry(
-                    low: shouldConvertToMgdL ? target.value.asMgdL : target.value,
-                    high: shouldConvertToMgdL ? target.value.asMgdL : target.value,
-                    start: target.time,
-                    offset: offset(target.time) / 60
-                )
-            }
-
-            let targetsProfile = BGTargets(units: .mgdL, userPreferredUnits: .mgdL, targets: targets)
+            let settings = try NightscoutProfileConverter.therapySettings(from: fetchedProfile)
 
             // Store therapy settings in-memory in state model for further review
             finalizeImport(
-                targets: targetsProfile,
-                basals: basals,
-                carbRatios: carbratiosProfile,
-                sensitivities: sensitivitiesProfile,
-                userPreferredUnitsFromImport: fetchedProfile.units,
+                targets: settings.targets,
+                basals: settings.basals,
+                carbRatios: settings.carbRatios,
+                sensitivities: settings.sensitivities,
+                userPreferredUnitsFromImport: settings.units,
                 currentStep: currentStep
             )
         } catch {
@@ -234,9 +151,7 @@ extension Onboarding.StateModel {
     }
 
     fileprivate func offset(_ string: String) -> Int {
-        let hours = Int(string.prefix(2)) ?? 0
-        let minutes = Int(string.suffix(2)) ?? 0
-        return ((hours * 60) + minutes) * 60
+        NightscoutProfileConverter.offset(string)
     }
 
     enum ImportStatus {

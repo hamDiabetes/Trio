@@ -71,6 +71,7 @@ public extension PumpEventStored {
         case nsSensorChange = "Sensor Start"
         case nsExercise = "Exercise"
         case capillaryGlucose = "BG Check"
+        case nsProfileSwitch = "Profile Switch"
     }
 
     enum TempType: String, JSON {

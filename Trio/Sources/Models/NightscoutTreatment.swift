@@ -23,6 +23,10 @@ struct NightscoutTreatment: JSON, Hashable, Equatable {
     var units: String?
     var id: String?
     var fpuID: String?
+    /// Name of the profile a Profile Switch treatment selects.
+    var profile: String?
+    /// The profile as it was when the switch happened, so a later edit does not rewrite history.
+    var profileJson: String?
 
     static let local = "Trio"
 
@@ -61,5 +65,7 @@ extension NightscoutTreatment {
         case units
         case id
         case fpuID
+        case profile
+        case profileJson
     }
 }

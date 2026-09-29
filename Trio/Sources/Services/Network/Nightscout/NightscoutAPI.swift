@@ -33,6 +33,17 @@ class NightscoutAPI {
         case missingURL
     }
 
+    /// Distinguishes a site that will not let Trio update a profile document in place from one that
+    /// merely failed this time. Only the former is worth retrying as a create.
+    enum ProfileDocumentError: LocalizedError {
+        case updateRejected(statusCode: Int)
+
+        var isPermissionDenied: Bool {
+            guard case let .updateRejected(statusCode) = self else { return false }
+            return [401, 403, 405].contains(statusCode)
+        }
+    }
+
     let url: URL
     let secret: String?
 
@@ -404,12 +415,19 @@ extension NightscoutAPI {
         }
     }
 
-    func uploadProfile(_ profile: NightscoutProfileStore) async throws {
+    /// Fetches the current profile document verbatim.
+    ///
+    /// Deliberately not decoded into `NightscoutProfileStore`: that type has no optional fields, so a
+    /// single hand-edited profile in the store fails the decode of the whole document, and any key
+    /// Trio does not model would be dropped on the way back out.
+    /// Returns nil when the site has no profile document yet.
+    func fetchProfileDocument() async throws -> JSONValue? {
         var components = URLComponents()
         components.scheme = url.scheme
         components.host = url.host
         components.port = url.port
         components.path = Config.profilePath
+        components.queryItems = [URLQueryItem(name: "count", value: "1")]
 
         guard let url = components.url else {
             throw URLError(.badURL)
@@ -417,25 +435,83 @@ extension NightscoutAPI {
 
         var request = URLRequest(url: url)
         request.timeoutInterval = Config.timeout
-        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
 
         if let secret = secret {
             request.addValue(secret.sha1(), forHTTPHeaderField: "api-secret")
         }
 
-        do {
-            let encodedBody = try JSONCoding.encoder.encode(profile)
-            request.httpBody = encodedBody
-//            debugPrint("Payload profile upload size: \(encodedBody.count) bytes")
-//            debugPrint(String(data: encodedBody, encoding: .utf8) ?? "Invalid payload")
-        } catch {
-            debugPrint("Error encoding payload: \(error)")
-            throw error
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse, (200 ... 299).contains(httpResponse.statusCode) else {
+            throw URLError(.badServerResponse)
         }
-        request.httpMethod = "POST"
+
+        let documents = try JSONCoding.decoder.decode([JSONValue].self, from: data)
+        return documents.first
+    }
+
+    /// Updates an existing profile document in place. Requires `_id` in the body.
+    ///
+    /// Nightscout treats the newest profile document as the active one and ignores any Profile Switch
+    /// treatment older than it, so creating a new document on every settings change would invalidate
+    /// Trio's own switch records. Updating in place is what the Nightscout profile editor does.
+    func updateProfileDocument(_ document: JSONValue) async throws {
+        var components = URLComponents()
+        components.scheme = url.scheme
+        components.host = url.host
+        components.port = url.port
+        components.path = Config.profilePath
+
+        guard let url = components.url, document["_id"]?.stringValue != nil else {
+            throw URLError(.badURL)
+        }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = Config.timeout
+        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpMethod = "PUT"
+
+        if let secret = secret {
+            request.addValue(secret.sha1(), forHTTPHeaderField: "api-secret")
+        }
+
+        request.httpBody = try JSONCoding.encoder.encode(document)
 
         let (_, response) = try await URLSession.shared.data(for: request)
-        if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode != 200 {
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw URLError(.badServerResponse)
+        }
+        guard (200 ... 299).contains(httpResponse.statusCode) else {
+            throw ProfileDocumentError.updateRejected(statusCode: httpResponse.statusCode)
+        }
+    }
+
+    /// Creates a new profile document, used when the site has none yet or when an in-place update is
+    /// not permitted by the site's token.
+    func createProfileDocument(_ document: JSONValue) async throws {
+        var components = URLComponents()
+        components.scheme = url.scheme
+        components.host = url.host
+        components.port = url.port
+        components.path = Config.profilePath
+
+        guard let url = components.url, var body = document.objectValue else {
+            throw URLError(.badURL)
+        }
+        body.removeValue(forKey: "_id")
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = Config.timeout
+        request.addValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpMethod = "POST"
+
+        if let secret = secret {
+            request.addValue(secret.sha1(), forHTTPHeaderField: "api-secret")
+        }
+
+        request.httpBody = try JSONCoding.encoder.encode(JSONValue.object(body))
+
+        let (_, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse, (200 ... 299).contains(httpResponse.statusCode) else {
             throw URLError(.badServerResponse)
         }
     }
@@ -507,6 +583,35 @@ extension NightscoutAPI {
         }
 
 //        debugPrint("Upload successful, response data: \(String(data: data, encoding: .utf8) ?? "No data")")
+    }
+
+    /// Every named profile on the site, keyed by name, from the current profile document, and the
+    /// names of any Trio could not read.
+    func fetchProfileStore() async throws -> NightscoutProfileStoreContents {
+        guard let store = try await fetchProfileDocument()?["store"]?.objectValue else {
+            return NightscoutProfileStoreContents(profiles: [:], unreadable: [])
+        }
+        return Self.readStore(store)
+    }
+
+    static func readStore(_ store: [String: JSONValue]) -> NightscoutProfileStoreContents {
+        // Decoded per entry rather than as a whole document: `ScheduledNightscoutProfile` has no
+        // optional fields, so one profile hand-edited into an unreadable shape would otherwise take
+        // every other profile down with it.
+        var profiles: [String: ScheduledNightscoutProfile] = [:]
+        var unreadable: [String] = []
+        for (name, entry) in store {
+            guard let entryData = try? JSONCoding.encoder.encode(entry),
+                  let profile = try? JSONCoding.decoder.decode(ScheduledNightscoutProfile.self, from: entryData)
+            else {
+                warning(.nightscout, "Skipping unreadable Nightscout profile '\(name)'")
+                unreadable.append(name)
+                continue
+            }
+            profiles[name] = profile
+        }
+
+        return NightscoutProfileStoreContents(profiles: profiles, unreadable: unreadable.sorted())
     }
 
     func importSettings() async throws -> ScheduledNightscoutProfile {
