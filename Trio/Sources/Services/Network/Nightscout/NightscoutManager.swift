@@ -19,7 +19,43 @@ protocol NightscoutManager: GlucoseSource {
     func uploadProfiles() async throws
     func uploadNoteTreatment(note: String) async
     func importSettings() async -> ScheduledNightscoutProfile?
+    func fetchProfileStore() async throws -> NightscoutProfileStoreContents
+    func saveNamedProfile(_ name: String, profile: ScheduledNightscoutProfile) async throws
+    func deleteNamedProfile(_ name: String) async throws
+    func uploadProfileSwitch(name: String, profile: ScheduledNightscoutProfile) async throws
     var cgmURL: URL? { get }
+}
+
+enum NightscoutProfileWriteError: LocalizedError {
+    case uploadDisabled
+
+    var errorDescription: String? {
+        String(localized: "Uploading to Nightscout is turned off, so profiles cannot be saved or deleted.")
+    }
+}
+
+/// Serializes profile document writes.
+///
+/// `uploadProfiles()` runs on every therapy settings change, and the document is written by reading the
+/// current one and merging into it. Two overlapping cycles would both read the same document and the
+/// later write would discard whatever the earlier one merged.
+private actor ProfileUploadCoordinator {
+    private var pending: Task<Void, Never>?
+
+    func run(_ work: @escaping () async throws -> Void) async throws {
+        let previous = pending
+        let task = Task<Result<Void, Error>, Never> {
+            await previous?.value
+            do {
+                try await work()
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+        pending = Task { _ = await task.value }
+        try await task.value.get()
+    }
 }
 
 final class BaseNightscoutManager: NightscoutManager, Injectable {
@@ -39,6 +75,7 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
     @Injected() private var apsManager: APSManager!
 
     private let processQueue = DispatchQueue(label: "BaseNetworkManager.processQueue")
+    private let profileUploadCoordinator = ProfileUploadCoordinator()
     private var ping: TimeInterval?
 
     /// Coalesces and serializes upload runs so no two runs of the same pipeline overlap.
@@ -864,7 +901,9 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
                     return
                 }
 
-                try await nightscout.uploadProfile(profileStore)
+                try await profileUploadCoordinator.run {
+                    try await self.writeProfileStore(profileStore, using: nightscout)
+                }
 
                 BuildDetails.shared.recordUploadedExpireDate(expireDate: expireDate)
 
@@ -876,6 +915,185 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
         } else {
             debug(.nightscout, "Upload to NS disabled; aborting profile uploaded")
         }
+    }
+
+    /// Publishes Trio's therapy settings without disturbing the rest of the Nightscout profile document.
+    ///
+    /// Trio owns one entry in the store and a handful of top-level keys; everything else in the document
+    /// belongs to whoever put it there. Uploading only Trio's own entry would leave Nightscout's newest
+    /// document holding a single profile, hiding every other named profile from anything that reads the
+    /// current document.
+    private func writeProfileStore(_ profileStore: NightscoutProfileStore, using nightscout: NightscoutAPI) async throws {
+        let encoded = try JSONCoding.encoder.encode(profileStore)
+        let own = try JSONCoding.decoder.decode(JSONValue.self, from: encoded)
+        guard let ownFields = own.objectValue,
+              let ownEntry = own["store"]?[profileStore.defaultProfile]
+        else {
+            throw URLError(.cannotParseResponse)
+        }
+
+        try await mutateProfileDocument(using: nightscout, ifMissing: ownFields) { fields, store in
+            store[profileStore.defaultProfile] = ownEntry
+
+            // Trio's own top-level keys carry the remote-control payload and must track the live app,
+            // but startDate and mills are deliberately left alone: advancing them would make this
+            // document newer than any Profile Switch treatment, which Nightscout then ignores.
+            for key in [
+                "defaultProfile",
+                "units",
+                "enteredBy",
+                "bundleIdentifier",
+                "deviceToken",
+                "isAPNSProduction",
+                "overridePresets",
+                "teamID",
+                "expirationDate"
+            ]
+            {
+                fields[key] = ownFields[key]
+            }
+        }
+    }
+
+    /// Applies an edit to the site's profile document, leaving every part of it Trio does not own alone.
+    ///
+    /// - Parameter ifMissing: the document to create when the site has none yet.
+    private func mutateProfileDocument(
+        using nightscout: NightscoutAPI,
+        ifMissing seed: [String: JSONValue]? = nil,
+        _ mutate: (inout [String: JSONValue], inout [String: JSONValue]) throws -> Void
+    ) async throws {
+        // A failure to read is not a licence to write a document built from anything else: publishing
+        // one assembled without knowing what is already there is how named profiles disappear.
+        let existing: JSONValue?
+        do {
+            existing = try await nightscout.fetchProfileDocument()
+        } catch {
+            debug(.nightscout, "Could not read the Nightscout profile document (\(error)); skipping profile write")
+            throw error
+        }
+
+        guard let document = existing, var fields = document.objectValue else {
+            guard var seed else {
+                throw URLError(.cannotParseResponse)
+            }
+            seed.removeValue(forKey: "_id")
+            try await nightscout.createProfileDocument(.object(seed))
+            return
+        }
+
+        guard var store = fields["store"]?.objectValue else {
+            // A store that is missing or not an object cannot be merged into without inventing one,
+            // and inventing one would publish a document holding only Trio's profile.
+            throw URLError(.cannotParseResponse)
+        }
+
+        try mutate(&fields, &store)
+        fields["store"] = .object(store)
+
+        do {
+            try await nightscout.updateProfileDocument(.object(fields))
+        } catch let error as NightscoutAPI.ProfileDocumentError where error.isPermissionDenied {
+            // A site whose token cannot update in place still needs its settings published. Creating a
+            // document preserves every profile; it only costs the Profile Switch treatment ordering.
+            debug(.nightscout, "Nightscout will not update the profile document in place; creating one instead")
+            fields.removeValue(forKey: "_id")
+            let now = Date()
+            fields["startDate"] = try JSONCoding.decoder.decode(
+                JSONValue.self,
+                from: JSONCoding.encoder.encode(now)
+            )
+            fields["mills"] = .number(Decimal(Int(now.timeIntervalSince1970) * 1000))
+            try await nightscout.createProfileDocument(.object(fields))
+        }
+    }
+
+    /// Records a profile switch in Nightscout.
+    ///
+    /// `duration: 0` marks the switch as indefinite, which is what Nightscout's own loader queries for.
+    /// The profile is attached as it was applied so a later edit to it does not rewrite what the
+    /// history says was running.
+    func uploadProfileSwitch(name: String, profile: ScheduledNightscoutProfile) async throws {
+        guard isUploadEnabled else {
+            debug(.nightscout, "Upload to NS disabled; not writing profile data")
+            return
+        }
+        guard let nightscout = nightscoutAPI, isNetworkReachable else {
+            throw URLError(.notConnectedToInternet)
+        }
+
+        let snapshot = try JSONCoding.encoder.encode(profile)
+        let treatment = NightscoutTreatment(
+            duration: 0,
+            rawDuration: nil,
+            rawRate: nil,
+            absolute: nil,
+            rate: nil,
+            eventType: .nsProfileSwitch,
+            createdAt: Date(),
+            enteredBy: NightscoutTreatment.local,
+            bolus: nil,
+            insulin: nil,
+            notes: nil,
+            carbs: nil,
+            fat: nil,
+            protein: nil,
+            foodType: nil,
+            targetTop: nil,
+            targetBottom: nil,
+            glucoseType: nil,
+            glucose: nil,
+            units: nil,
+            id: UUID().uuidString,
+            fpuID: nil,
+            profile: name,
+            profileJson: String(data: snapshot, encoding: .utf8)
+        )
+
+        try await nightscout.uploadTreatments([treatment])
+    }
+
+    /// Writes one named profile into the site's store, leaving the others untouched.
+    func saveNamedProfile(_ name: String, profile: ScheduledNightscoutProfile) async throws {
+        // Saving and deleting are requests to change Nightscout, so quietly doing nothing would leave
+        // the screen claiming a change the site never saw.
+        guard isUploadEnabled else {
+            throw NightscoutProfileWriteError.uploadDisabled
+        }
+        guard let nightscout = nightscoutAPI, isNetworkReachable else {
+            throw URLError(.notConnectedToInternet)
+        }
+        let encoded = try JSONCoding.encoder.encode(profile)
+        let entry = try JSONCoding.decoder.decode(JSONValue.self, from: encoded)
+
+        try await profileUploadCoordinator.run {
+            try await self.mutateProfileDocument(using: nightscout) { _, store in
+                store[name] = entry
+            }
+        }
+    }
+
+    /// Removes one named profile from the site's store.
+    func deleteNamedProfile(_ name: String) async throws {
+        guard isUploadEnabled else {
+            throw NightscoutProfileWriteError.uploadDisabled
+        }
+        guard let nightscout = nightscoutAPI, isNetworkReachable else {
+            throw URLError(.notConnectedToInternet)
+        }
+
+        try await profileUploadCoordinator.run {
+            try await self.mutateProfileDocument(using: nightscout) { _, store in
+                store.removeValue(forKey: name)
+            }
+        }
+    }
+
+    func fetchProfileStore() async throws -> NightscoutProfileStoreContents {
+        guard let nightscout = nightscoutAPI else {
+            throw URLError(.badURL)
+        }
+        return try await nightscout.fetchProfileStore()
     }
 
     func importSettings() async -> ScheduledNightscoutProfile? {
