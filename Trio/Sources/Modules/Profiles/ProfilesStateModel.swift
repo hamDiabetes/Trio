@@ -51,7 +51,7 @@ extension Profiles {
             pendingBlocks = []
             do {
                 let therapy = try NightscoutProfileConverter.therapySettings(from: item.profile)
-                pendingBlocks = await switchService.blocks(for: therapy, pumpSettings: item.trioSettings?.pumpSettings)
+                pendingBlocks = await switchService.blocks(for: therapy, profileSettings: item.trioSettings)
                 pendingChanges = ProfileSwitchPreview(
                     incoming: therapy,
                     current: await provider.currentTherapySettings(),
@@ -73,6 +73,7 @@ extension Profiles {
             switchInProgress = true
             defer { switchInProgress = false }
 
+            let earlierMarker = switchService.interruptedSwitch?.switchID
             do {
                 let therapy = try NightscoutProfileConverter.therapySettings(from: item.profile)
                 try await switchService.apply(
@@ -113,10 +114,12 @@ extension Profiles {
                 // alert on a view a sheet is covering.
                 pendingSwitch = nil
                 interrupted = switchService.interruptedSwitch
-                if interrupted == nil {
-                    errorMessage = error.localizedDescription
-                } else {
+                // A refusal before anything changed leaves an earlier marker in place, and has to say
+                // why it refused rather than repeat the earlier switch's story.
+                if let interrupted, interrupted.switchID != earlierMarker {
                     showInterruptedAlert = true
+                } else {
+                    errorMessage = error.localizedDescription
                 }
                 await load()
             }
@@ -173,7 +176,7 @@ extension Profiles {
 
         var canSaveNewProfile: Bool {
             let trimmed = newProfileName.trimmingCharacters(in: .whitespacesAndNewlines)
-            return !trimmed.isEmpty && trimmed != Self.liveProfileName
+            return !trimmed.isEmpty && trimmed.caseInsensitiveCompare(Self.liveProfileName) != .orderedSame
         }
 
         var newProfileNameIsTaken: Bool {
@@ -188,7 +191,7 @@ extension Profiles {
             if let existing = items.first(where: { $0.name.caseInsensitiveCompare(trimmed) == .orderedSame }) {
                 trimmed = existing.name
             }
-            guard !trimmed.isEmpty, trimmed != Self.liveProfileName else { return }
+            guard !trimmed.isEmpty, trimmed.caseInsensitiveCompare(Self.liveProfileName) != .orderedSame else { return }
 
             guard let therapy = await provider.currentTherapySettings() else {
                 errorMessage = String(localized: "Could not read the current therapy settings.")

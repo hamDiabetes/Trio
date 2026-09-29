@@ -92,17 +92,17 @@ struct ProfileSwitchPreview {
             return
         }
 
-        // Compared key by key against the live values, so the screen lists only what actually moves.
-        let currentJSON = (try? JSONCoding.encoder.encode(currentPreferences))
-            .flatMap { try? JSONCoding.decoder.decode(JSONValue.self, from: $0) }?
-            .objectValue ?? [:]
+        // Compared after the overlay the switch applies, so keys Trio no longer reads are not listed.
+        let current = (try? JSONValue(encoding: currentPreferences).objectValue) ?? [:]
+        let incoming = (try? Profiles.SwitchService.overlay(profileSettings, onto: currentPreferences))
+            .flatMap { try? JSONValue(encoding: $0).objectValue } ?? current
 
-        preferenceChanges = profileSettings.preferences
-            .filter { key, value in currentJSON[key] != value }
+        preferenceChanges = incoming
+            .filter { key, value in current[key] != value }
             .map { key, value in
                 Change(
                     label: ProfileSwitchPreview.readableName(for: key),
-                    from: ProfileSwitchPreview.describe(currentJSON[key]),
+                    from: ProfileSwitchPreview.describe(current[key]),
                     to: ProfileSwitchPreview.describe(value)
                 )
             }

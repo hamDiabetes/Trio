@@ -15,8 +15,7 @@ extension TargetsEditor {
 
         var rateValues: [Decimal] {
             let settingsProvider = PickerSettingsProvider.shared
-            let glucoseSetting = PickerSetting(value: 110, step: 1, min: 72, max: 180, type: .glucose)
-            return settingsProvider.generatePickerValues(from: glucoseSetting, units: units)
+            return settingsProvider.generatePickerValues(from: settingsProvider.settings.glucoseTarget, units: units)
         }
 
         var canAdd: Bool {

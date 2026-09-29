@@ -933,26 +933,52 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
         }
 
         try await mutateProfileDocument(using: nightscout, ifMissing: ownFields) { fields, store in
-            store[profileStore.defaultProfile] = ownEntry
-
-            // Trio's own top-level keys carry the remote-control payload and must track the live app,
-            // but startDate and mills are deliberately left alone: advancing them would make this
-            // document newer than any Profile Switch treatment, which Nightscout then ignores.
-            for key in [
-                "defaultProfile",
-                "units",
-                "enteredBy",
-                "bundleIdentifier",
-                "deviceToken",
-                "isAPNSProduction",
-                "overridePresets",
-                "teamID",
-                "expirationDate"
-            ]
-            {
-                fields[key] = ownFields[key]
-            }
+            Self.mergeOwnProfile(ownFields, entry: ownEntry, named: profileStore.defaultProfile, into: &fields, store: &store)
         }
+    }
+
+    /// Trio's own top-level keys carry the remote-control payload and track the live app. startDate and
+    /// mills are left alone: advancing them would make the document newer than any Profile Switch
+    /// treatment, which Nightscout then ignores.
+    static let trioOwnedProfileKeys = [
+        "defaultProfile",
+        "units",
+        "enteredBy",
+        "bundleIdentifier",
+        "deviceToken",
+        "isAPNSProduction",
+        "overridePresets",
+        "teamID",
+        "expirationDate"
+    ]
+
+    static func mergeOwnProfile(
+        _ own: [String: JSONValue],
+        entry: JSONValue,
+        named name: String,
+        into fields: inout [String: JSONValue],
+        store: inout [String: JSONValue]
+    ) {
+        store[name] = entry
+        for key in trioOwnedProfileKeys {
+            fields[key] = own[key]
+        }
+    }
+
+    /// Applies `mutate` to a fetched document's store. A store that is missing or not an object cannot
+    /// be merged into without inventing one, and inventing one would publish a document holding only
+    /// Trio's profile.
+    static func mergedProfileDocument(
+        _ document: [String: JSONValue],
+        _ mutate: (inout [String: JSONValue], inout [String: JSONValue]) throws -> Void
+    ) throws -> [String: JSONValue] {
+        var fields = document
+        guard var store = fields["store"]?.objectValue else {
+            throw URLError(.cannotParseResponse)
+        }
+        try mutate(&fields, &store)
+        fields["store"] = .object(store)
+        return fields
     }
 
     /// Applies an edit to the site's profile document, leaving every part of it Trio does not own alone.
@@ -982,14 +1008,7 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
             return
         }
 
-        guard var store = fields["store"]?.objectValue else {
-            // A store that is missing or not an object cannot be merged into without inventing one,
-            // and inventing one would publish a document holding only Trio's profile.
-            throw URLError(.cannotParseResponse)
-        }
-
-        try mutate(&fields, &store)
-        fields["store"] = .object(store)
+        fields = try Self.mergedProfileDocument(fields, mutate)
 
         do {
             try await nightscout.updateProfileDocument(.object(fields))
@@ -1022,15 +1041,23 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
             throw URLError(.notConnectedToInternet)
         }
 
+        try await nightscout.uploadTreatments([Self.profileSwitchTreatment(name: name, profile: profile, at: Date())])
+    }
+
+    static func profileSwitchTreatment(
+        name: String,
+        profile: ScheduledNightscoutProfile,
+        at date: Date
+    ) throws -> NightscoutTreatment {
         let snapshot = try JSONCoding.encoder.encode(profile)
-        let treatment = NightscoutTreatment(
+        return NightscoutTreatment(
             duration: 0,
             rawDuration: nil,
             rawRate: nil,
             absolute: nil,
             rate: nil,
             eventType: .nsProfileSwitch,
-            createdAt: Date(),
+            createdAt: date,
             enteredBy: NightscoutTreatment.local,
             bolus: nil,
             insulin: nil,
@@ -1049,8 +1076,6 @@ final class BaseNightscoutManager: NightscoutManager, Injectable {
             profile: name,
             profileJson: String(data: snapshot, encoding: .utf8)
         )
-
-        try await nightscout.uploadTreatments([treatment])
     }
 
     /// Writes one named profile into the site's store, leaving the others untouched.

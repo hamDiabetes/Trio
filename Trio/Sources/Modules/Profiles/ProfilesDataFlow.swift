@@ -47,9 +47,7 @@ struct TrioProfileSettings: JSON, Equatable {
     }
 
     init(from preferences: Preferences, pumpSettings: PumpSettings?) throws {
-        let encoded = try JSONCoding.encoder.encode(preferences)
-        let value = try JSONCoding.decoder.decode(JSONValue.self, from: encoded)
-        self.preferences = value.objectValue ?? [:]
+        self.preferences = try JSONValue(encoding: preferences).objectValue ?? [:]
         self.pumpSettings = pumpSettings
     }
 }

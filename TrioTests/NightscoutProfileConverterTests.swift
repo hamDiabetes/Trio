@@ -148,4 +148,107 @@ import Testing
         #expect(Array(contents.profiles.keys) == ["Good"])
         #expect(contents.unreadable == ["Broken"])
     }
+
+    @Test("Schedules are put in time order") func schedulesSorted() throws {
+        let settings = try NightscoutProfileConverter.therapySettings(from: profile(
+            targetLow: [("12:00", 110), ("00:00", 100)],
+            sens: [("18:00", 90), ("00:00", 80)],
+            basal: [("00:00", 0.45), ("12:00", 0.5), ("06:00", 0.6)],
+            carbratio: [("06:00", 12), ("00:00", 18)]
+        ))
+        #expect(settings.basals.map(\.minutes) == [0, 360, 720])
+        #expect(settings.carbRatios.schedule.map(\.offset) == [0, 360])
+        #expect(settings.sensitivities.sensitivities.map(\.offset) == [0, 1080])
+        #expect(settings.targets.targets.map(\.offset) == [0, 720])
+    }
+
+    @Test("A schedule that misses midnight or repeats a time is refused") func malformedSchedulesRefused() {
+        for bad in [
+            profile(basal: [("01:00", 0.45)]),
+            profile(basal: [("00:00", 0.45), ("06:00", 0.5), ("06:00", 0.6)]),
+            profile(carbratio: [("06:00", 12)]),
+            profile(sens: [("00:00", 80), ("00:00", 90)]),
+            profile(targetLow: [("08:00", 100)])
+        ] {
+            #expect(throws: NightscoutProfileImportError.malformedSchedule) {
+                try NightscoutProfileConverter.therapySettings(from: bad)
+            }
+        }
+    }
+
+    // An mmol sensitivity typed into a mg/dL profile reads as far more aggressive than meant.
+    @Test("Sensitivities and ratios outside the editors' ranges are refused") func editorRangesEnforced() throws {
+        #expect(throws: NightscoutProfileImportError.sensitivityOutOfRange(8)) {
+            try NightscoutProfileConverter.therapySettings(from: profile(sens: [("00:00", 8)]))
+        }
+        #expect(throws: NightscoutProfileImportError.sensitivityOutOfRange(541)) {
+            try NightscoutProfileConverter.therapySettings(from: profile(sens: [("00:00", 541)]))
+        }
+        #expect(throws: NightscoutProfileImportError.carbRatioOutOfRange(0.9)) {
+            try NightscoutProfileConverter.therapySettings(from: profile(carbratio: [("00:00", 0.9)]))
+        }
+        #expect(throws: NightscoutProfileImportError.carbRatioOutOfRange(51)) {
+            try NightscoutProfileConverter.therapySettings(from: profile(carbratio: [("00:00", 51)]))
+        }
+        _ = try NightscoutProfileConverter.therapySettings(from: profile(sens: [("00:00", 9)], carbratio: [("00:00", 1)]))
+        _ = try NightscoutProfileConverter.therapySettings(from: profile(sens: [("00:00", 540)], carbratio: [("00:00", 50)]))
+    }
+
+    @Test("Targets above the editor's range are refused") func highTargetRefused() throws {
+        #expect(throws: NightscoutProfileImportError.implausibleTargets(181)) {
+            try NightscoutProfileConverter.therapySettings(from: profile(targetLow: [("00:00", 181)]))
+        }
+        _ = try NightscoutProfileConverter.therapySettings(from: profile(targetLow: [("00:00", 180)]))
+    }
+
+    // MARK: - Profile document merge
+
+    private func document() throws -> [String: JSONValue] {
+        let text = #"""
+        {"_id": "abc", "startDate": "2026-08-01T00:00:00.000Z", "mills": 1785542400000, "custom": "keep",
+         "deviceToken": "old", "store": {"default": {"dia": 6}, "Tianna": {"dia": 7}}}
+        """#
+        return try JSONCoding.decoder.decode(JSONValue.self, from: text.data(using: .utf8)!).objectValue ?? [:]
+    }
+
+    @Test("Publishing Trio's entry keeps every other profile and key") func mergeKeepsOthers() throws {
+        let own: [String: JSONValue] = ["deviceToken": .string("new"), "startDate": .string("now"), "mills": .number(1)]
+        let merged = try BaseNightscoutManager.mergedProfileDocument(document()) { fields, store in
+            BaseNightscoutManager.mergeOwnProfile(
+                own,
+                entry: .object(["dia": .number(5)]),
+                named: "default",
+                into: &fields,
+                store: &store
+            )
+        }
+
+        #expect(merged["store"]?["Tianna"] == .object(["dia": .number(7)]))
+        #expect(merged["store"]?["default"] == .object(["dia": .number(5)]))
+        #expect(merged["custom"] == .string("keep"))
+        #expect(merged["_id"] == .string("abc"))
+        #expect(merged["deviceToken"] == .string("new"))
+        // Advancing these would make the document newer than every Profile Switch treatment.
+        #expect(merged["startDate"] == .string("2026-08-01T00:00:00.000Z"))
+        #expect(merged["mills"] == .number(1_785_542_400_000))
+    }
+
+    @Test("A document without a readable store is not rebuilt around Trio's entry") func missingStoreRefused() throws {
+        var bad = try document()
+        bad["store"] = .string("not a store")
+        #expect(throws: URLError.self) {
+            _ = try BaseNightscoutManager.mergedProfileDocument(bad) { _, store in store["default"] = .null }
+        }
+    }
+
+    @Test("A profile switch is recorded as an indefinite switch to the named profile") func switchTreatmentFields() throws {
+        let data = try JSONCoding.encoder.encode(
+            BaseNightscoutManager.profileSwitchTreatment(name: "Tianna", profile: profile(), at: Date())
+        )
+        let fields = try JSONCoding.decoder.decode(JSONValue.self, from: data)
+        #expect(fields["eventType"] == .string("Profile Switch"))
+        #expect(fields["profile"] == .string("Tianna"))
+        #expect(fields["duration"] == .number(0))
+        #expect(fields["profileJson"]?.stringValue?.contains("\"basal\"") == true)
+    }
 }

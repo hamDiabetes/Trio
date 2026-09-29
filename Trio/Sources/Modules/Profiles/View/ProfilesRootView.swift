@@ -194,24 +194,35 @@ extension Profiles {
         /// the pump and Trio can be running different settings.
         private var interruptedMessage: String {
             guard let marker = state.interrupted else { return "" }
+            let stage: String
             if marker.pumpAcceptedAfterTimeout == true {
-                return String(
-                    localized: "Switching to \(marker.profileName) timed out, and your pump accepted the new basal rates afterwards. Your pump has the new basal rates but Trio is still using the old settings. Switch again or check your basal rates before dosing."
+                stage = String(
+                    localized: "Switching to \(marker.profileName) timed out, and your pump accepted the new basal rates afterwards. Your pump has the new basal rates but Trio's therapy settings were not changed."
+                )
+            } else if !marker.pumpWriteConfirmed {
+                stage = String(
+                    localized: "Switching to \(marker.profileName) did not finish, and your pump did not confirm the new basal rates. It may have the old or the new ones."
+                )
+            } else if !marker.settingsWritten {
+                stage = String(
+                    localized: "Switching to \(marker.profileName) did not finish. Your pump has the new basal rates but Trio may still be using the old therapy settings."
+                )
+            } else {
+                stage = String(
+                    localized: "Switching to \(marker.profileName) did not finish. The new basal rates and therapy settings are in place, but the algorithm settings may not be."
                 )
             }
-            if !marker.pumpWriteConfirmed {
-                return String(
-                    localized: "Switching to \(marker.profileName) was interrupted before your pump confirmed the new basal rates. Check your pump's basal rates before dosing."
+            let limits = marker.pumpLimitsWritten == true
+                ?
+                String(
+                    localized: "Insulin duration, maximum bolus and maximum basal were already changed to the profile's values."
                 )
-            }
-            if !marker.settingsWritten {
-                return String(
-                    localized: "Switching to \(marker.profileName) was interrupted. Your pump has the new basal rates but Trio may still be using the old therapy settings. Check your settings before dosing."
+                : ""
+            let check =
+                String(
+                    localized: "A running override or temporary target may have been ended. Check your settings before dosing."
                 )
-            }
-            return String(
-                localized: "Switching to \(marker.profileName) was interrupted near the end. Check your therapy settings before dosing."
-            )
+            return [stage, limits, check].filter { !$0.isEmpty }.joined(separator: " ")
         }
 
         @ViewBuilder private var switchSheet: some View {
