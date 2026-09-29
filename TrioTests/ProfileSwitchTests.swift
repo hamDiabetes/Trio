@@ -330,6 +330,8 @@ import Testing
         #expect(await !recovered.value)
     }
 
+    // Recovery from a failure in time has to finish before the switch releases the loop, so a loop
+    // never starts against a pod still being resumed. A slow recovery shows whether it waited.
     @Test("A failure in time recovers delivery and is reported") func failureInTime() async {
         let recovered = ResumeFlag()
         let lateSuccess = ResumeFlag()
@@ -338,7 +340,10 @@ import Testing
             try await Profiles.SwitchService.boundedPumpWrite(
                 timeout: 5,
                 send: { reply in reply(.failure(URLError(.cannotConnectToHost))) },
-                recoverAfterFailure: { await recovered.set() },
+                recoverAfterFailure: {
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                    await recovered.set()
+                },
                 onLateSuccess: { await lateSuccess.set() }
             )
         }
