@@ -258,20 +258,23 @@ import Testing
         #expect(await eventually { await released.value })
     }
 
-    // Some pump managers call back twice. The second reply must not be taken for a late one.
-    @Test("A repeated reply is not recorded as a late one") func duplicateReplyIgnored() async throws {
-        let lateSuccess = ResumeFlag()
-        try await Profiles.SwitchService.boundedPumpWrite(
-            timeout: 5,
-            send: { reply in
-                reply(.success(()))
-                reply(.success(()))
-            },
-            recoverAfterFailure: {},
-            onLateSuccess: { await lateSuccess.set() }
-        )
+    // Some pump managers call back twice. A repeated failure must not resume delivery a second time.
+    @Test("A repeated reply is acted on once") func duplicateReplyIgnored() async throws {
+        let recoveries = Counter()
+        await #expect(throws: URLError.self) {
+            try await Profiles.SwitchService.boundedPumpWrite(
+                timeout: 5,
+                send: { reply in
+                    reply(.failure(URLError(.cannotConnectToHost)))
+                    reply(.failure(URLError(.cannotConnectToHost)))
+                },
+                recoverAfterFailure: { await recoveries.increment() },
+                onLateSuccess: {}
+            )
+        }
+        #expect(await eventually { await recoveries.value == 1 })
         try await Task.sleep(nanoseconds: 100_000_000)
-        #expect(await !lateSuccess.value)
+        #expect(await recoveries.value == 1)
     }
 
     // A slow recovery must not turn a failure the pump reported in time into a timeout.
@@ -661,6 +664,11 @@ import Testing
         await loopGuard.endExclusion(token)
         #expect(await eventually { await started.value })
     }
+}
+
+private actor Counter {
+    private(set) var value = 0
+    func increment() { value += 1 }
 }
 
 private actor ResumeFlag {
