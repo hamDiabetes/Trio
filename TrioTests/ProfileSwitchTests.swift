@@ -245,13 +245,45 @@ import Testing
         #expect((try? result.get()) != nil)
     }
 
-    @Test("A waiter parked before either settles is released by the deadline") func deadlineReleasesWaiter() async {
+    @Test("A waiter parked before either settles is released by the deadline") func deadlineReleasesWaiter() async throws {
         let outcome = PumpWriteOutcome()
+        let released = ResumeFlag()
         Task {
-            try? await Task.sleep(nanoseconds: 50_000_000)
-            await outcome.expire()
+            _ = await outcome.wait()
+            await released.set()
         }
-        #expect(await outcome.wait() == nil)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        #expect(await !released.value)
+        await outcome.expire()
+        #expect(await eventually { await released.value })
+    }
+
+    // Some pump managers call back twice. The second reply must not be taken for a late one.
+    @Test("A repeated reply is not recorded as a late one") func duplicateReplyIgnored() async throws {
+        let lateSuccess = ResumeFlag()
+        try await Profiles.SwitchService.boundedPumpWrite(
+            timeout: 5,
+            send: { reply in
+                reply(.success(()))
+                reply(.success(()))
+            },
+            recoverAfterFailure: {},
+            onLateSuccess: { await lateSuccess.set() }
+        )
+        try await Task.sleep(nanoseconds: 100_000_000)
+        #expect(await !lateSuccess.value)
+    }
+
+    // A slow recovery must not turn a failure the pump reported in time into a timeout.
+    @Test("A failure is reported as itself even when recovery is slow") func slowRecoveryKeepsError() async {
+        await #expect(throws: URLError.self) {
+            try await Profiles.SwitchService.boundedPumpWrite(
+                timeout: 0.2,
+                send: { reply in reply(.failure(URLError(.cannotConnectToHost))) },
+                recoverAfterFailure: { try? await Task.sleep(nanoseconds: 1_000_000_000) },
+                onLateSuccess: {}
+            )
+        }
     }
 
     // The deadline paths are where S2 lives: a write that fails after the switch stopped waiting may
@@ -272,6 +304,7 @@ import Testing
 
         captured.reply?(.failure(URLError(.timedOut)))
         #expect(await eventually { await recovered.value })
+        try await Task.sleep(nanoseconds: 50_000_000)
         #expect(await !lateSuccess.value)
     }
 
@@ -406,13 +439,17 @@ import Testing
         #expect(readBack.targets.targets.map(\.low) == original.targets.targets.map(\.low))
     }
 
-    // The encoder's key order is not stable between calls. A fingerprint built on it made every
-    // applied profile read as edited.
-    @Test("The applied-profile fingerprint is the same every time") func fingerprintIsStable() {
-        let prints = Set((0 ..< 20).map { _ in
-            Profiles.Provider.fingerprint(therapy: therapy(), preferences: Preferences(), pumpSettings: pump())
-        })
-        #expect(prints.count == 1)
+    // The encoder's key order is not stable between processes, and the fingerprint is stored across
+    // launches. A test in one process cannot see the drift, so it checks the order itself.
+    @Test("The applied-profile fingerprint encodes keys in sorted order") func fingerprintKeysSorted() throws {
+        let data = try Profiles.Provider.canonicalJSON(BasalProfileEntry(start: "00:00", minutes: 0, rate: 0.45))
+        let text = try #require(String(data: data, encoding: .utf8))
+        let parts = text.components(separatedBy: "\"")
+        let keys = stride(from: 1, to: parts.count - 1, by: 2)
+            .filter { parts[$0 + 1].trimmingCharacters(in: .whitespaces).hasPrefix(":") }
+            .map { parts[$0] }
+        #expect(keys == keys.sorted())
+        #expect(keys.count == 3)
     }
 
     @Test("The fingerprint changes when a dosing limit does") func fingerprintSeesLimits() {
@@ -430,24 +467,8 @@ import Testing
         #expect(ProfileSwitchPreview.readableName(for: "autosens_max") == "Autosens Max")
     }
 
-    // Decides whether a running temp basal is protection against a low, so an off-by-one at a block
-    // boundary lets a switch cancel a zero temp.
-    @Test("The scheduled rate is the block that has started") func scheduledRateLookup() {
-        let profile = [
-            BasalProfileEntry(start: "00:00", minutes: 0, rate: 0.45),
-            BasalProfileEntry(start: "06:30", minutes: 390, rate: 0.6),
-            BasalProfileEntry(start: "22:00", minutes: 1320, rate: 0.35)
-        ]
-
-        #expect(Profiles.SwitchService.scheduledRate(in: profile, atMinute: 0) == 0.45)
-        #expect(Profiles.SwitchService.scheduledRate(in: profile, atMinute: 389) == 0.45)
-        #expect(Profiles.SwitchService.scheduledRate(in: profile, atMinute: 390) == 0.6)
-        #expect(Profiles.SwitchService.scheduledRate(in: profile, atMinute: 1439) == 0.35)
-        #expect(Profiles.SwitchService.scheduledRate(in: [], atMinute: 600) == 0)
-    }
-
     @Test("Every failure a switch can report explains what to check") func errorsExplainThemselves() {
-        for error in [ProfileSwitchError.settingsNotWritten, .preferencesNotWritten] {
+        for error in ProfileSwitchError.allCases {
             let message = error.errorDescription ?? ""
             #expect(message.contains("before dosing"))
         }
@@ -456,7 +477,7 @@ import Testing
     @Test("A blocked switch explains itself") func blocksHaveMessages() {
         let blocks: [ProfileSwitchBlock] = [
             .noPump, .pumpSuspended, .bolusInProgress, .looping,
-            .reducedTempBasalRunning, .unsupportedBasalRate(0.325)
+            .reducedTempBasalRunning, .unsupportedBasalRate(0.325), .unreadableSettings
         ]
 
         for block in blocks {
@@ -519,7 +540,8 @@ import Testing
             await loopGuard.waitForLoop()
             await resumed.set()
         }
-        try await Task.sleep(nanoseconds: 50_000_000)
+        // Released only once the waiter is known to be parked, or the wake-up path is never exercised.
+        #expect(await eventually { await loopGuard.waiterCount == 1 })
         #expect(await !resumed.value)
 
         await loopGuard.endExclusion(token)
@@ -531,6 +553,113 @@ import Testing
             finished = await resumed.value
         }
         #expect(finished)
+    }
+
+    // MARK: - Preflight as wired
+
+    private func preflight(
+        temp: Decimal? = nil,
+        scheduled: Decimal? = 0.45,
+        suspended: Bool = false,
+        bolusing: Bool = false,
+        looping: Bool = false
+    ) -> ProfileSwitchPreflight {
+        ProfileSwitchPreflight(
+            suspended: suspended,
+            bolusInProgress: bolusing,
+            looping: looping,
+            tempBasalRate: temp,
+            scheduledRate: scheduled
+        )
+    }
+
+    private func preflightBlocks(_ preflight: ProfileSwitchPreflight, incoming: PumpSettings? = nil) -> [ProfileSwitchBlock] {
+        Profiles.SwitchService.blocks(
+            preflight: preflight,
+            basals: [BasalProfileEntry(start: "00:00", minutes: 0, rate: 0.5)],
+            incoming: incoming,
+            live: pump()
+        )
+    }
+
+    @Test("A temp basal below the schedule blocks a switch, and one at or above it does not") func reducedTempBlocks() {
+        #expect(preflightBlocks(preflight(temp: 0)).contains(.reducedTempBasalRunning))
+        #expect(preflightBlocks(preflight(temp: 0.4)).contains(.reducedTempBasalRunning))
+        #expect(!preflightBlocks(preflight(temp: 0.45)).contains(.reducedTempBasalRunning))
+        #expect(!preflightBlocks(preflight(temp: 1.2)).contains(.reducedTempBasalRunning))
+        #expect(!preflightBlocks(preflight()).contains(.reducedTempBasalRunning))
+    }
+
+    @Test("A running temp basal blocks when the schedule cannot be read") func unknownScheduleBlocks() {
+        #expect(preflightBlocks(preflight(temp: 1.2, scheduled: nil)).contains(.reducedTempBasalRunning))
+    }
+
+    @Test("Suspension, a bolus and a running loop each block a switch") func pumpStateBlocks() {
+        #expect(preflightBlocks(preflight(suspended: true)) == [.pumpSuspended])
+        #expect(preflightBlocks(preflight(bolusing: true)) == [.bolusInProgress])
+        #expect(preflightBlocks(preflight(looping: true)) == [.looping])
+        #expect(preflightBlocks(preflight()).isEmpty)
+    }
+
+    @Test("Preflight checks the profile's own dosing limits") func preflightChecksIncomingLimits() {
+        #expect(preflightBlocks(preflight(), incoming: pump(maxBolus: 31)).contains(.pumpLimitOutOfRange(.maxBolus, 31)))
+    }
+
+    @Test("Without a pump nothing else is checked but the profile's limits") func noPumpBlocks() {
+        #expect(preflightBlocks(ProfileSwitchPreflight(pumpPresent: false)) == [.noPump])
+    }
+
+    // MARK: - Holding the loop
+
+    @Test("The loop is released after the work succeeds") func holdReleasedOnSuccess() async throws {
+        let ended = ResumeFlag()
+        try await Profiles.SwitchService.holdingLoop(begin: { true }, end: { await ended.set() }) {}
+        #expect(await ended.value)
+    }
+
+    @Test("The loop is released when the work fails") func holdReleasedOnFailure() async {
+        let ended = ResumeFlag()
+        await #expect(throws: URLError.self) {
+            try await Profiles.SwitchService.holdingLoop(begin: { true }, end: { await ended.set() }) {
+                throw URLError(.cannotConnectToHost)
+            }
+        }
+        #expect(await ended.value)
+    }
+
+    @Test("Nothing runs when the loop cannot be held") func holdRefused() async {
+        let ran = ResumeFlag()
+        let ended = ResumeFlag()
+        await #expect(throws: ProfileSwitchBlock.looping) {
+            try await Profiles.SwitchService.holdingLoop(begin: { false }, end: { await ended.set() }) {
+                await ran.set()
+            }
+        }
+        #expect(await !ran.value)
+        #expect(await !ended.value)
+    }
+
+    // MARK: - Standalone determinations
+
+    @Test("A standalone determination refuses an exclusion") func standaloneRefusesExclusion() async {
+        let loopGuard = LoopGuard()
+        #expect(await loopGuard.waitAndStartStandaloneDetermination())
+        #expect(await loopGuard.tryExclude() == nil)
+        await loopGuard.finishStandaloneDetermination()
+        #expect(await loopGuard.tryExclude() != nil)
+    }
+
+    @Test("A standalone determination waits for an exclusion to end") func standaloneWaitsForExclusion() async throws {
+        let loopGuard = LoopGuard()
+        let token = try #require(await loopGuard.tryExclude())
+        let started = ResumeFlag()
+        Task {
+            if await loopGuard.waitAndStartStandaloneDetermination() { await started.set() }
+        }
+        #expect(await eventually { await loopGuard.waiterCount == 1 })
+        #expect(await !started.value)
+        await loopGuard.endExclusion(token)
+        #expect(await eventually { await started.value })
     }
 }
 

@@ -40,37 +40,36 @@ struct NightscoutTherapySettings {
     let units: String
 }
 
-enum NightscoutProfileImportError: LocalizedError {
-    case invalidCarbRatios
+enum NightscoutProfileImportError: LocalizedError, Equatable {
+    case carbRatioOutOfRange(Decimal)
     case invalidBasalRates
-    case zeroTotalBasal
-    case invalidSensitivities
+    case sensitivityOutOfRange(Decimal)
     case missingTargets
     case implausibleTargets(Decimal)
     case ambiguousUnits(String)
-    case malformedBasalSchedule
+    case malformedSchedule
 
     var errorDescription: String? {
         switch self {
-        case .invalidCarbRatios:
-            return String(localized: "Invalid Carb Ratio settings in Nightscout. Import aborted.")
+        case let .carbRatioOutOfRange(value):
+            return String(
+                localized: "The Nightscout profile has a carb ratio of \(value) g/U, which is outside the range Trio accepts. Import aborted."
+            )
         case .invalidBasalRates:
             return String(localized: "Invalid Nightscout basal rates found. Import aborted.")
-        case .zeroTotalBasal:
+        case let .sensitivityOutOfRange(value):
             return String(
-                localized: "Invalid Nightscout basal rates found. Basal rate total cannot be 0 U/hr. Import aborted."
+                localized: "The Nightscout profile has an insulin sensitivity of \(value) mg/dL/U, which is outside the range Trio accepts. Import aborted."
             )
-        case .invalidSensitivities:
-            return String(localized: "Invalid Nightscout insulin sensitivity profile. Import aborted.")
         case .missingTargets:
             return String(localized: "The Nightscout profile has no glucose targets. Import aborted.")
         case let .implausibleTargets(value):
             return String(
                 localized: "The Nightscout profile has a glucose target of \(value) mg/dL, which is outside the range Trio accepts. Import aborted."
             )
-        case .malformedBasalSchedule:
+        case .malformedSchedule:
             return String(
-                localized: "The Nightscout profile's basal schedule does not start at midnight or has repeated times. Import aborted."
+                localized: "A schedule in the Nightscout profile does not start at midnight or has repeated times. Import aborted."
             )
         case let .ambiguousUnits(units):
             return String(
@@ -81,14 +80,17 @@ enum NightscoutProfileImportError: LocalizedError {
 }
 
 enum NightscoutProfileConverter {
-    /// Targets Trio is prepared to accept from a profile, in mg/dL.
-    ///
-    /// Matches the bounds of Trio's own targets editor, since a target outside them cannot be
-    /// represented once imported and would be silently coerced to the nearest one it can.
-    /// It also catches the realistic way the unit guess below is defeated: a profile authored
-    /// elsewhere can carry a placeholder target of 0, which reads as mmol/L and multiplies every
-    /// sensitivity by 18.
-    private static let plausibleTargetRange: ClosedRange<Decimal> = 72 ... 180
+    /// The ranges Trio's own editors allow, in mg/dL and g/U. A value outside them cannot be entered by
+    /// hand, and a zero target is also how the unit guess below is defeated: it reads as mmol/L and
+    /// multiplies every sensitivity by 18.
+    private static var sensitivityRange: ClosedRange<Decimal> { range(\.insulinSensitivity) }
+    private static var targetRange: ClosedRange<Decimal> { range(\.glucoseTarget) }
+    private static var carbRatioRange: ClosedRange<Decimal> { range(\.carbRatio) }
+
+    private static func range(_ setting: KeyPath<DecimalPickerSettings, PickerSetting>) -> ClosedRange<Decimal> {
+        let picker = PickerSettingsProvider.shared.settings[keyPath: setting]
+        return picker.min ... picker.max
+    }
 
     /// Whether a profile's values need converting from mmol/L.
     ///
@@ -112,49 +114,38 @@ enum NightscoutProfileConverter {
             throw NightscoutProfileImportError.ambiguousUnits(profile.units)
         }
 
-        let carbRatioEntries = profile.carbratio.map { entry in
-            CarbRatioEntry(start: entry.time, offset: offset(entry.time) / 60, ratio: entry.value)
+        let carbRatioEntries = try schedule(profile.carbratio) { time, minutes, value in
+            CarbRatioEntry(start: time, offset: minutes, ratio: value)
         }
-        guard !carbRatioEntries.contains(where: { $0.ratio <= 0 }) else {
-            throw NightscoutProfileImportError.invalidCarbRatios
+        if let bad = carbRatioEntries.first(where: { !carbRatioRange.contains($0.ratio) }) {
+            throw NightscoutProfileImportError.carbRatioOutOfRange(bad.ratio)
         }
 
-        // Sorted here because the pump's schedule type neither sorts nor validates: an entry missing
-        // from midnight, or a repeated time, reaches a fatalError once the schedule is looked up.
-        let basals = profile.basal
-            .map { BasalProfileEntry(start: $0.time, minutes: offset($0.time) / 60, rate: $0.value) }
-            .sorted { $0.minutes < $1.minutes }
+        // The pump's schedule type neither sorts nor validates, and an entry missing from midnight or a
+        // repeated time reaches a fatalError once the schedule is looked up.
+        let basals = try schedule(profile.basal) { time, minutes, value in
+            BasalProfileEntry(start: time, minutes: minutes, rate: value)
+        }
         guard !basals.contains(where: { $0.rate <= 0 }) else {
             throw NightscoutProfileImportError.invalidBasalRates
         }
-        let basalMinutes = basals.map(\.minutes)
-        guard basalMinutes.first == 0, Set(basalMinutes).count == basalMinutes.count else {
-            throw NightscoutProfileImportError.malformedBasalSchedule
+
+        let sensitivityEntries = try schedule(profile.sens) { time, minutes, value in
+            InsulinSensitivityEntry(sensitivity: convert ? value.asMgdL : value, offset: minutes, start: time)
         }
-        guard basals.reduce(0, { $0 + $1.rate }) > 0 else {
-            throw NightscoutProfileImportError.zeroTotalBasal
+        if let bad = sensitivityEntries.first(where: { !sensitivityRange.contains($0.sensitivity) }) {
+            throw NightscoutProfileImportError.sensitivityOutOfRange(bad.sensitivity)
         }
 
-        let sensitivityEntries = profile.sens.map { entry in
-            InsulinSensitivityEntry(
-                sensitivity: convert ? entry.value.asMgdL : entry.value,
-                offset: offset(entry.time) / 60,
-                start: entry.time
-            )
-        }
-        guard !sensitivityEntries.contains(where: { $0.sensitivity <= 0 }) else {
-            throw NightscoutProfileImportError.invalidSensitivities
-        }
-
-        let targetEntries = profile.target_low.map { entry in
-            let value = convert ? entry.value.asMgdL : entry.value
-            return BGTargetEntry(low: value, high: value, start: entry.time, offset: offset(entry.time) / 60)
-        }
-        guard !targetEntries.isEmpty else {
+        guard !profile.target_low.isEmpty else {
             throw NightscoutProfileImportError.missingTargets
         }
-        if let outOfRange = targetEntries.first(where: { !plausibleTargetRange.contains($0.low) }) {
-            throw NightscoutProfileImportError.implausibleTargets(outOfRange.low)
+        let targetEntries = try schedule(profile.target_low) { time, minutes, value in
+            let target = convert ? value.asMgdL : value
+            return BGTargetEntry(low: target, high: target, start: time, offset: minutes)
+        }
+        if let bad = targetEntries.first(where: { !targetRange.contains($0.low) }) {
+            throw NightscoutProfileImportError.implausibleTargets(bad.low)
         }
 
         return NightscoutTherapySettings(
@@ -168,6 +159,21 @@ enum NightscoutProfileConverter {
             ),
             units: profile.units
         )
+    }
+
+    /// Builds a schedule in time order, refusing one that does not start at midnight or repeats a time.
+    private static func schedule<Entry>(
+        _ values: [NightscoutTimevalue],
+        _ make: (String, Int, Decimal) -> Entry
+    ) throws -> [Entry] {
+        let sorted = values
+            .map { (value: $0, minutes: offset($0.time) / 60) }
+            .sorted { $0.minutes < $1.minutes }
+        let minutes = sorted.map(\.minutes)
+        guard minutes.first == 0, Set(minutes).count == minutes.count else {
+            throw NightscoutProfileImportError.malformedSchedule
+        }
+        return sorted.map { make($0.value.time, $0.minutes, $0.value.value) }
     }
 
     /// Whether a profile carries a target range rather than a single target.

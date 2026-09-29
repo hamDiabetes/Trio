@@ -133,6 +133,10 @@ struct DecimalPickerSettings {
     var minuteInterval = PickerSetting(value: 30, step: 5, min: 30, max: 60, type: PickerSetting.PickerSettingType.minute)
     var hours = PickerSetting(value: 6, step: 0.5, min: 2, max: 24, type: PickerSetting.PickerSettingType.hour)
     var dia = PickerSetting(value: 10, step: 0.5, min: 5, max: 10, type: PickerSetting.PickerSettingType.hour)
+    var insulinSensitivity = PickerSetting(value: 100, step: 1, min: 9, max: 540, type: PickerSetting.PickerSettingType.glucose)
+    var glucoseTarget = PickerSetting(value: 110, step: 1, min: 72, max: 180, type: PickerSetting.PickerSettingType.glucose)
+    /// The carb ratio editor's range, 1 to 50 g/U in steps of 0.1.
+    var carbRatio = PickerSetting(value: 10, step: 0.1, min: 1, max: 50, type: PickerSetting.PickerSettingType.gram)
     var maxBolus = PickerSetting(value: 10, step: 0.5, min: 0.5, max: 30, type: PickerSetting.PickerSettingType.insulinUnit)
     var maxBasal = PickerSetting(
         value: 10,

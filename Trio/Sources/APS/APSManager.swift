@@ -116,9 +116,10 @@ actor LoopGuard {
     }
 
     /// Claims the guard so no loop starts until `endExclusion` is called with the returned token.
-    /// Refuses while a loop runs. Ignores the loop interval: this is not a loop.
+    /// Refuses while a loop or a standalone determination runs, since either reads the settings the
+    /// holder is about to rewrite. Ignores the loop interval: this is not a loop.
     func tryExclude() -> UUID? {
-        guard !isRunning, exclusion == nil else { return nil }
+        guard !isRunning, !isDeterminingStandalone, exclusion == nil else { return nil }
         let token = UUID()
         exclusion = token
         return token
@@ -131,6 +132,9 @@ actor LoopGuard {
         exclusion = nil
         resumeWaitersIfIdle()
     }
+
+    /// Callers parked in `waitForLoop`, so tests can tell a parked waiter from one that never waited.
+    var waiterCount: Int { loopWaiters.count }
 
     private func resumeWaitersIfIdle() {
         guard !isRunning, exclusion == nil else { return }
@@ -146,6 +150,13 @@ actor LoopGuard {
         guard !isDeterminingStandalone else { return false }
         isDeterminingStandalone = true
         return true
+    }
+
+    /// Waits out a running loop and any exclusion, then claims a standalone determination in the same
+    /// step, so an exclusion cannot be taken between the wait and the claim.
+    func waitAndStartStandaloneDetermination() async -> Bool {
+        await waitForLoop()
+        return tryStartStandaloneDetermination()
     }
 
     func finishStandaloneDetermination() {
@@ -616,8 +627,7 @@ final class BaseAPSManager: APSManager, Injectable {
     }
 
     func determineBasalSync() async throws {
-        await loopGuard.waitForLoop()
-        guard await loopGuard.tryStartStandaloneDetermination() else {
+        guard await loopGuard.waitAndStartStandaloneDetermination() else {
             debug(.apsManager, "Standalone determination skipped: one is already running")
             return
         }

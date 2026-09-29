@@ -68,3 +68,10 @@ indirect enum JSONValue: Codable, Equatable {
         objectValue?[key]
     }
 }
+
+extension JSONValue {
+    /// A value as its own JSON encoding carries it.
+    init(encoding value: some Encodable) throws {
+        self = try JSONCoding.decoder.decode(JSONValue.self, from: JSONCoding.encoder.encode(value))
+    }
+}

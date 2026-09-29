@@ -93,9 +93,10 @@ extension Profiles {
                 carbsPerHour = preferences.min5mCarbimpact * 12 / sensitivity * ratio
             }
 
+            // Saved in mg/dL whatever the display unit: mmol/L at one decimal does not survive the trip back.
             return NightscoutProfileConverter.nightscoutProfile(
                 from: therapy,
-                units: settingsManager.settings.units,
+                units: .mgdL,
                 dia: settingsManager.pumpSettings.insulinActionCurve,
                 carbsPerHour: Int(carbsPerHour)
             )
@@ -121,31 +122,33 @@ extension Profiles {
             Self.fingerprint(therapy: therapy, preferences: preferences, pumpSettings: pumpSettings)
         }
 
-        /// A stable digest of everything a switch applies.
-        ///
-        /// Compared against the fingerprint recorded at switch time so the screen can say a profile has
-        /// been edited since it was applied, rather than claiming settings that are no longer running.
-        /// Keys are sorted because the encoder's key order varies from one call to the next, which
-        /// otherwise made every profile look edited.
+        /// A digest of everything a switch applies, stored so the screen can tell a profile that is still
+        /// running from one edited since.
         static func fingerprint(
             therapy: NightscoutTherapySettings,
             preferences: Preferences,
             pumpSettings: PumpSettings
         ) -> String {
             var hasher = SHA256()
-            let encoder = JSONCoding.encoder
-            encoder.outputFormatting.insert(.sortedKeys)
             for data in [
-                try? encoder.encode(therapy.targets),
-                try? encoder.encode(therapy.basals),
-                try? encoder.encode(therapy.carbRatios),
-                try? encoder.encode(therapy.sensitivities),
-                try? encoder.encode(preferences),
-                try? encoder.encode(pumpSettings)
+                try? canonicalJSON(therapy.targets),
+                try? canonicalJSON(therapy.basals),
+                try? canonicalJSON(therapy.carbRatios),
+                try? canonicalJSON(therapy.sensitivities),
+                try? canonicalJSON(preferences),
+                try? canonicalJSON(pumpSettings)
             ] {
                 hasher.update(data: data ?? Data())
             }
             return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        }
+
+        /// Keys sorted, because the encoder's key order changes between launches and the fingerprint is
+        /// compared across them.
+        static func canonicalJSON(_ value: some Encodable) throws -> Data {
+            let encoder = JSONCoding.encoder
+            encoder.outputFormatting.insert(.sortedKeys)
+            return try encoder.encode(value)
         }
     }
 }

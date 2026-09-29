@@ -1,4 +1,4 @@
-import CoreData
+import Combine
 import Foundation
 import LoopKit
 import LoopKitUI
@@ -18,6 +18,7 @@ enum ProfileSwitchBlock: LocalizedError, Equatable, Hashable {
     case unsupportedBasalRate(Decimal)
     case pumpLimitOutOfRange(ProfilePumpLimit, Decimal)
     case basalAboveMaxBasal(rate: Decimal, maxBasal: Decimal)
+    case unreadableSettings
 
     var errorDescription: String? {
         switch self {
@@ -38,6 +39,10 @@ enum ProfileSwitchBlock: LocalizedError, Equatable, Hashable {
         case let .pumpLimitOutOfRange(limit, value):
             return String(
                 localized: "This profile sets \(limit.label) to \(value) \(limit.unit), outside the \(limit.range.lowerBound)–\(limit.range.upperBound) \(limit.unit) Trio allows."
+            )
+        case .unreadableSettings:
+            return String(
+                localized: "Trio cannot read this profile's saved algorithm settings. Save the profile again before switching to it."
             )
         case let .basalAboveMaxBasal(rate, maxBasal):
             return String(
@@ -89,32 +94,40 @@ enum ProfilePumpLimit: String, Hashable, CaseIterable {
     }
 }
 
-/// A switch that started but whose outcome is unknown.
-///
-/// Written before the pump is touched and cleared only once everything downstream has succeeded. If it
-/// survives, the pod and the algorithm may disagree and a person has to be told.
+/// A switch that started but did not finish. It stays until a switch succeeds or someone confirms the
+/// pump, because until then the pump and Trio may be running different settings.
 struct ProfileSwitchMarker: JSON, Equatable {
     let profileName: String
     let startedAt: Date
-    /// False until the pump has acknowledged the new schedule.
     var pumpWriteConfirmed: Bool
-    /// False until all four therapy files have been written and read back.
     var settingsWritten: Bool
-    /// The pump accepted the new schedule after the switch had stopped waiting, so the pump runs the
-    /// new basal rates while Trio kept the old settings.
     var pumpAcceptedAfterTimeout: Bool? = nil
-    /// Identifies the switch, so a late reply updates the marker of the switch that sent it.
+    /// Insulin duration, maximum bolus and maximum basal had already been changed.
+    var pumpLimitsWritten: Bool? = nil
     var switchID: UUID? = UUID()
 }
 
+/// What preflight needs to know about the pump and the loop, gathered in one place so the rules can be
+/// checked without a pump.
+struct ProfileSwitchPreflight {
+    var pumpPresent = true
+    var suspended = false
+    var bolusInProgress = false
+    var looping = false
+    var tempBasalRate: Decimal?
+    /// Nil when the running schedule cannot be read.
+    var scheduledRate: Decimal?
+    var supportedBasalRates: [Decimal] = []
+}
+
 extension Profiles {
-    /// Applies a profile: the one operation here that changes what the pump delivers.
     final class SwitchService: Injectable {
         @Injected() private var apsManager: APSManager!
         @Injected() private var settingsManager: SettingsManager!
         @Injected() private var storage: FileStorage!
-        @Injected() private var nightscout: NightscoutManager!
         @Injected() private var adjustmentManager: AdjustmentManager!
+        @Injected() private var broadcaster: Broadcaster!
+        @Injected() private var tidepoolManager: TidepoolManager!
 
         private let resolver: Resolver
 
@@ -133,42 +146,67 @@ extension Profiles {
 
         // MARK: - Preflight
 
-        /// Everything that would stop a switch, checked before anything changes.
-        func blocks(for therapy: NightscoutTherapySettings, pumpSettings: PumpSettings?) async -> [ProfileSwitchBlock] {
-            var blocks = Self.limitBlocks(
+        func blocks(for therapy: NightscoutTherapySettings, profileSettings: TrioProfileSettings?) async -> [ProfileSwitchBlock] {
+            var blocks = Self.blocks(
+                preflight: currentPreflight(),
                 basals: therapy.basals,
-                incoming: pumpSettings,
+                incoming: profileSettings?.pumpSettings,
                 live: settingsManager.pumpSettings
             )
-
-            guard let pump = apsManager.pumpManager else {
-                blocks.append(.noPump)
-                return blocks
+            if let profileSettings, (try? Self.overlay(profileSettings, onto: settingsManager.preferences)) == nil {
+                blocks.append(.unreadableSettings)
             }
-
-            if apsManager.isSuspended {
-                blocks.append(.pumpSuspended)
-            }
-            if apsManager.bolusProgress.value != nil {
-                blocks.append(.bolusInProgress)
-            }
-            if apsManager.isLooping.value {
-                blocks.append(.looping)
-            }
-            if isReducedTempBasalRunning() {
-                blocks.append(.reducedTempBasalRunning)
-            }
-
-            let supported = pump.supportedBasalRates.map { Decimal($0) }
-            if !supported.isEmpty, let unsupported = therapy.basals.first(where: { !supported.contains($0.rate) }) {
-                blocks.append(.unsupportedBasalRate(unsupported.rate))
-            }
-
             return blocks
         }
 
-        /// Values a profile would install that Trio's own screens would refuse, and basal rates above
-        /// the maximum basal that would be in force after the switch.
+        private func currentPreflight() -> ProfileSwitchPreflight {
+            guard let pump = apsManager.pumpManager else {
+                return ProfileSwitchPreflight(pumpPresent: false)
+            }
+            var preflight = ProfileSwitchPreflight(
+                suspended: apsManager.isSuspended,
+                bolusInProgress: apsManager.bolusProgress.value != nil,
+                looping: apsManager.isLooping.value,
+                supportedBasalRates: pump.supportedBasalRates.map { Decimal($0) }
+            )
+            if case let .tempBasal(dose) = pump.status.basalDeliveryState {
+                preflight.tempBasalRate = Decimal(dose.unitsPerHour)
+                let schedule = storage.retrieve(OpenAPS.Settings.basalProfile, as: [BasalProfileEntry].self) ?? []
+                preflight.scheduledRate = (try? Basal.basalLookup(schedule, now: Date())) ?? nil
+            }
+            return preflight
+        }
+
+        static func blocks(
+            preflight: ProfileSwitchPreflight,
+            basals: [BasalProfileEntry],
+            incoming: PumpSettings?,
+            live: PumpSettings
+        ) -> [ProfileSwitchBlock] {
+            var blocks = limitBlocks(basals: basals, incoming: incoming, live: live)
+            guard preflight.pumpPresent else {
+                return blocks + [.noPump]
+            }
+            if preflight.suspended { blocks.append(.pumpSuspended) }
+            if preflight.bolusInProgress { blocks.append(.bolusInProgress) }
+            if preflight.looping { blocks.append(.looping) }
+
+            // A temp below the schedule is usually Trio holding back against a low. Writing a schedule
+            // cancels it and nothing restores it until the next loop. When the schedule cannot be read,
+            // any running temp is treated as one.
+            if let temp = preflight.tempBasalRate, temp < (preflight.scheduledRate ?? .greatestFiniteMagnitude) {
+                blocks.append(.reducedTempBasalRunning)
+            }
+
+            let supported = preflight.supportedBasalRates
+            if !supported.isEmpty, let unsupported = basals.first(where: { !supported.contains($0.rate) }) {
+                blocks.append(.unsupportedBasalRate(unsupported.rate))
+            }
+            return blocks
+        }
+
+        /// Values Trio's own settings screens would refuse, and basal rates above the maximum basal in
+        /// force after the switch.
         static func limitBlocks(
             basals: [BasalProfileEntry],
             incoming: PumpSettings?,
@@ -187,82 +225,74 @@ extension Profiles {
             return blocks
         }
 
-        /// A temp basal below the scheduled rate is usually Trio holding back against a falling glucose.
-        /// Changing the schedule cancels it and resumes full delivery, and nothing puts it back until the
-        /// next reading.
-        ///
-        /// Read from the pump's own delivery state rather than from storage: Trio keeps enacted temp
-        /// basals in Core Data, and the file this once read is not written by anything.
-        private func isReducedTempBasalRunning() -> Bool {
-            guard case let .tempBasal(dose)? = apsManager.pumpManager?.status.basalDeliveryState else {
-                return false
-            }
-            let profile = storage.retrieve(OpenAPS.Settings.basalProfile, as: [BasalProfileEntry].self) ?? []
-            let now = Date()
-            let minutesNow = Calendar.current.component(.hour, from: now) * 60
-                + Calendar.current.component(.minute, from: now)
-            return Decimal(dose.unitsPerHour) < Self.scheduledRate(in: profile, atMinute: minutesNow)
-        }
-
-        /// The scheduled basal rate at a time of day, given as minutes from local midnight, which is
-        /// how offsets in a basal profile are expressed.
-        static func scheduledRate(in profile: [BasalProfileEntry], atMinute minute: Int) -> Decimal {
-            guard !profile.isEmpty else { return 0 }
-            return profile.last(where: { $0.minutes <= minute })?.rate ?? profile[0].rate
-        }
-
         // MARK: - Apply
 
-        /// Applies a profile, in the order that leaves the least dangerous state at every step.
-        ///
-        /// Reversible work happens first, the single irreversible step is next, and everything after it
-        /// is local. A failure anywhere leaves the marker behind so the screen can say what is unknown.
         @MainActor func apply(
             name: String,
             therapy: NightscoutTherapySettings,
             profileSettings: TrioProfileSettings?
         ) async throws {
-            // The confirmation sheet can sit open indefinitely, and delivery can be suspended, a bolus
-            // started or a loop begun in the meantime. None of those are visible to the checks made
-            // when it was opened.
-            let blocks = await blocks(for: therapy, pumpSettings: profileSettings?.pumpSettings)
-            if let block = blocks.first {
+            // Checked again because the confirmation can sit open while delivery is suspended, a bolus
+            // starts or a temp basal is set.
+            if let block = await blocks(for: therapy, profileSettings: profileSettings).first {
                 throw block
             }
-
-            // Checked above as well, but only this claim is atomic: a scheduled loop can start between
-            // any check and the first write, and would then read half old and half new settings.
-            guard await apsManager.beginLoopExclusion() else {
-                throw ProfileSwitchBlock.looping
-            }
+            // Worked out before anything changes, so a profile whose settings no longer decode is refused
+            // rather than failing after the pump write.
+            let preferences: Preferences?
             do {
-                try await applyWhileLoopIsHeld(name: name, therapy: therapy, profileSettings: profileSettings)
+                preferences = try profileSettings.map { try Self.overlay($0, onto: settingsManager.preferences) }
             } catch {
-                await apsManager.endLoopExclusion()
-                throw error
+                throw ProfileSwitchBlock.unreadableSettings
             }
-            await apsManager.endLoopExclusion()
 
-            // Recalculated against the new profile so the screens show it. Released first, since this
-            // waits for the hold.
+            try await Self.holdingLoop(
+                begin: { await self.apsManager.beginLoopExclusion() },
+                end: { await self.apsManager.endLoopExclusion() }
+            ) {
+                try await self.applyWhileLoopIsHeld(
+                    name: name,
+                    therapy: therapy,
+                    pumpSettings: profileSettings?.pumpSettings,
+                    preferences: preferences
+                )
+            }
+
+            // After the release, since this waits for it. It recalculates without enacting; the nudge
+            // below asks for a loop the way the Home screen does, subject to the loop interval.
             do {
                 try await apsManager.determineBasalSync()
             } catch {
                 debug(.apsManager, "Recalculation after a profile switch failed: \(error)")
             }
-
-            // Asks for a loop the way the Home screen's loop button does, so the new settings are enacted
-            // through the normal loop and its guards. The loop interval still applies: if a loop started
-            // under three minutes ago this is skipped, and the pump runs the new schedule until the next
-            // reading.
             apsManager.markNextLoopUserInitiated()
             apsManager.heartbeat(date: Date())
+        }
+
+        /// Runs `work` with the loop held off, and releases on every path. There is no timeout on the
+        /// hold, so `work` has to bound its own waits.
+        static func holdingLoop(
+            begin: () async -> Bool,
+            end: () async -> Void,
+            _ work: () async throws -> Void
+        ) async throws {
+            guard await begin() else {
+                throw ProfileSwitchBlock.looping
+            }
+            do {
+                try await work()
+            } catch {
+                await end()
+                throw error
+            }
+            await end()
         }
 
         @MainActor private func applyWhileLoopIsHeld(
             name: String,
             therapy: NightscoutTherapySettings,
-            profileSettings: TrioProfileSettings?
+            pumpSettings: PumpSettings?,
+            preferences: Preferences?
         ) async throws {
             var marker = ProfileSwitchMarker(
                 profileName: name,
@@ -272,45 +302,36 @@ extension Profiles {
             )
             storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
 
-            // 1. Cancel what is layered on top of the profile, before the profile changes underneath it.
-            //    Both are reversible and cancelling is the conservative direction.
             try await disableActiveAdjustments()
 
-            // 2. Insulin duration and delivery limits, before the schedule: a raised maximum basal has to
-            //    be in place before rates that need it are sent.
-            if let pumpSettings = profileSettings?.pumpSettings {
+            // Before the schedule, so a raised maximum basal is in place for the rates that need it.
+            if let pumpSettings {
                 try await writePumpSettings(pumpSettings)
+                marker.pumpLimitsWritten = true
+                storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
             }
 
-            // 3. The pump. The only step that cannot be undone, and the only one that can leave delivery
-            //    suspended if it fails part way through.
-            try await writeBasalSchedule(therapy.basals, switchID: marker.switchID)
+            try await writeBasalSchedule(therapy.basals, name: name, switchID: marker.switchID)
             marker.pumpWriteConfirmed = true
             storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
 
-            // 4. Therapy files, then read back: FileStorage.save swallows its errors, so a write that
-            //    failed would otherwise be indistinguishable from one that worked.
             try writeTherapySettings(therapy)
             marker.settingsWritten = true
             storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
+            announceTherapySettings(therapy)
 
-            // 5. Algorithm settings, overlaid key by key onto the live ones.
-            if let profileSettings {
-                try applyPreferences(profileSettings)
+            if let preferences {
+                try applyPreferences(preferences)
             }
 
-            // 6. Autosens was derived from deviations against the settings that have just been replaced,
-            //    and is otherwise reused for up to 30 minutes.
+            // Autosens was derived against the settings just replaced and is otherwise reused for 30 min.
             storage.remove(OpenAPS.Settings.autosense)
 
             clearInterruptedSwitch()
         }
 
-        /// Ends any running override and temp target.
-        ///
-        /// A switch replaces the settings an override is scaling, so leaving one running would apply an
-        /// old adjustment to new numbers. Routed through the adjustment manager because ending a temp
-        /// target in Core Data alone leaves it in the file oref reads, where it keeps applying.
+        /// Ends any running override and temp target. Through the adjustment manager, because ending a
+        /// temp target in Core Data alone leaves it in the file oref reads.
         private func disableActiveAdjustments() async throws {
             do {
                 try await adjustmentManager.cancelOverride(source: .app, waitForUpload: false)
@@ -321,24 +342,22 @@ extension Profiles {
             } catch AdjustmentError.nothingActive {}
         }
 
-        /// Writes the basal schedule to the pump.
-        ///
-        /// Never skipped on the grounds that the stored schedule already matches: there is no way to read
-        /// the pod's schedule back, and the stored copy diverges from it whenever a write goes
-        /// unacknowledged or onboarding writes the file with no pump attached.
-        private func writeBasalSchedule(_ basals: [BasalProfileEntry], switchID: UUID?) async throws {
+        // MARK: - Pump
+
+        /// Long enough for a slow pod and its retries. Past this the outcome is unknown.
+        static let pumpWriteTimeout: TimeInterval = 120
+
+        /// Never skipped because the stored schedule already matches: the pod's schedule cannot be read
+        /// back, and the stored copy diverges whenever a write goes unacknowledged.
+        private func writeBasalSchedule(_ basals: [BasalProfileEntry], name: String, switchID: UUID?) async throws {
             guard let pump = apsManager.pumpManager else {
                 throw ProfileSwitchBlock.noPump
             }
-
             let items = basals.map {
                 RepeatingScheduleValue(startTime: TimeInterval($0.minutes * 60), value: Double($0.rate))
             }
-
-            // Only a failure that happened after delivery was cancelled should be resumed from. Setting
-            // a schedule returns early — before cancelling anything — when there is no pod, when setup
-            // is incomplete, when a bolus is unfinished and when comms cannot be validated. Resuming in
-            // those cases would restart delivery that was deliberately suspended.
+            // Setting a schedule can fail before cancelling anything, and resuming then would restart
+            // delivery someone suspended on purpose.
             let wasSuspendedBefore = isDeliverySuspended(pump)
 
             try await Self.boundedPumpWrite(
@@ -348,20 +367,18 @@ extension Profiles {
                 },
                 recoverAfterFailure: {
                     if !wasSuspendedBefore, self.isDeliverySuspended(pump) {
-                        await self.resumeDeliveryAfterFailedWrite(pump)
+                        await self.resumeDelivery(pump)
                     }
                 },
-                onLateSuccess: { self.recordLatePumpAcceptance(switchID: switchID) }
+                onLateSuccess: { self.recordLatePumpAcceptance(name: name, switchID: switchID) }
             )
         }
 
-        /// Sends one pump command and waits for its reply, but not past `timeout`, because the loop is
-        /// held off until this returns.
+        /// Sends one pump command and waits for its reply, but not past `timeout`.
         ///
-        /// A reply after the deadline is still acted on. A late failure still runs the recovery, since
-        /// delivery may have been left suspended. A late success means the pump has the new schedule
-        /// while Trio kept the old one, which cannot be repaired from here — the loop is running again —
-        /// so it is recorded for a person to see instead.
+        /// The outcome is settled before any recovery runs, so a slow recovery cannot turn a failure into
+        /// a timeout. A failure runs the recovery even when it arrives late. A late success is handed to
+        /// `onLateSuccess`: the pump took the command after Trio stopped waiting.
         static func boundedPumpWrite(
             timeout: TimeInterval,
             send: (@escaping (Result<Void, Error>) -> Void) -> Void,
@@ -371,12 +388,11 @@ extension Profiles {
             let outcome = PumpWriteOutcome()
             send { result in
                 Task {
-                    if case .failure = result {
-                        await recoverAfterFailure()
-                    }
-                    let inTime = await outcome.finish(result)
-                    if !inTime, case .success = result {
-                        await onLateSuccess()
+                    let arrival = await outcome.finish(result)
+                    guard arrival != .duplicate else { return }
+                    switch result {
+                    case .failure: await recoverAfterFailure()
+                    case .success: if arrival == .late { await onLateSuccess() }
                     }
                 }
             }
@@ -392,48 +408,71 @@ extension Profiles {
             }
         }
 
-        /// Only the switch that sent the command is updated: by the time a late reply arrives a person may
-        /// already have started another.
-        private func recordLatePumpAcceptance(switchID: UUID?) {
-            guard var marker = interruptedSwitch, switchID != nil, marker.switchID == switchID else { return }
+        /// Updates the marker of the switch that sent the command, or recreates it if someone has cleared
+        /// it since. If another switch has started, its marker is left alone and the late reply is only
+        /// logged: that switch writes the whole schedule again.
+        private func recordLatePumpAcceptance(name: String, switchID: UUID?) {
+            debug(.service, "Pump accepted the \(name) basal schedule after the switch stopped waiting")
+            var marker = interruptedSwitch ?? ProfileSwitchMarker(
+                profileName: name,
+                startedAt: Date(),
+                pumpWriteConfirmed: false,
+                settingsWritten: false,
+                switchID: switchID
+            )
+            guard switchID != nil, marker.switchID == switchID else { return }
             marker.pumpWriteConfirmed = true
             marker.pumpAcceptedAfterTimeout = true
             storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
-            debug(.service, "Pump accepted the \(marker.profileName) basal schedule after the switch gave up waiting")
         }
-
-        /// Long enough for a slow pod and its retries. Past this the write's outcome is unknown.
-        static let pumpWriteTimeout: TimeInterval = 120
 
         private func isDeliverySuspended(_ pump: PumpManagerUI) -> Bool {
-            if case .suspended = pump.status.basalDeliveryState {
-                return true
-            }
-            return false
-        }
-
-        private func resumeDeliveryAfterFailedWrite(_ pump: PumpManagerUI) async {
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                pump.resumeDelivery { error in
-                    if let error {
-                        debug(.apsManager, "Could not resume delivery after a failed basal write: \(error)")
-                    }
-                    continuation.resume()
-                }
+            switch pump.status.basalDeliveryState {
+            case .suspended,
+                 .suspending: return true
+            default: return false
             }
         }
 
-        /// Saves through the same path as the settings screen, which syncs the limits to the pump and
-        /// stores what the pump reports back. Some pumps keep their own limits, so the stored values are
-        /// compared with what was asked for.
+        private func resumeDelivery(_ pump: PumpManagerUI) async {
+            do {
+                try await Self.boundedPumpWrite(
+                    timeout: Self.pumpWriteTimeout,
+                    send: { reply in
+                        pump.resumeDelivery { error in reply(error.map { .failure($0) } ?? .success(())) }
+                    },
+                    recoverAfterFailure: {},
+                    onLateSuccess: {}
+                )
+            } catch {
+                debug(.apsManager, "Could not resume delivery after a failed basal write: \(error)")
+            }
+        }
+
+        /// Saves through the settings screen's own path, which syncs the limits to the pump and stores
+        /// what the pump reports back.
         private func writePumpSettings(_ pumpSettings: PumpSettings) async throws {
             let provider = UnitsLimitsSettings.Provider(resolver: resolver)
-            for try await _ in provider.save(settings: pumpSettings).values {}
+            var subscription: AnyCancellable?
+            try await Self.boundedPumpWrite(
+                timeout: Self.pumpWriteTimeout,
+                send: { reply in
+                    subscription = provider.save(settings: pumpSettings).sink(
+                        receiveCompletion: { if case let .failure(error) = $0 { reply(.failure(error)) } },
+                        receiveValue: { reply(.success(())) }
+                    )
+                },
+                recoverAfterFailure: {},
+                onLateSuccess: {}
+            )
+            subscription?.cancel()
 
             guard storage.retrieve(OpenAPS.Settings.settings, as: PumpSettings.self) == pumpSettings else {
                 throw ProfileSwitchError.pumpSettingsNotWritten
             }
         }
+
+        // MARK: - Settings
 
         private func writeTherapySettings(_ therapy: NightscoutTherapySettings) throws {
             storage.transaction { storage in
@@ -443,14 +482,14 @@ extension Profiles {
                 storage.save(therapy.targets, as: OpenAPS.Settings.bgTargets)
             }
 
-            let written = storage.retrieve(OpenAPS.Settings.basalProfile, as: [BasalProfileEntry].self)
+            // FileStorage.save swallows its errors, so the files are read back. Times are compared as well
+            // as values.
+            let basals = storage.retrieve(OpenAPS.Settings.basalProfile, as: [BasalProfileEntry].self)
             let ratios = storage.retrieve(OpenAPS.Settings.carbRatios, as: CarbRatios.self)
             let sensitivities = storage.retrieve(OpenAPS.Settings.insulinSensitivities, as: InsulinSensitivities.self)
             let targets = storage.retrieve(OpenAPS.Settings.bgTargets, as: BGTargets.self)
 
-            // Times are compared as well as values: a schedule persisted with the right rates at the
-            // wrong times would otherwise pass as confirmed.
-            guard written?.map({ [$0.minutes: $0.rate] }) == therapy.basals.map({ [$0.minutes: $0.rate] }),
+            guard basals?.map({ [$0.minutes: $0.rate] }) == therapy.basals.map({ [$0.minutes: $0.rate] }),
                   ratios?.schedule.map({ [$0.offset: $0.ratio] })
                   == therapy.carbRatios.schedule.map({ [$0.offset: $0.ratio] }),
                   sensitivities?.sensitivities.map({ [$0.offset: $0.sensitivity] })
@@ -461,26 +500,28 @@ extension Profiles {
             }
         }
 
-        /// Overlays a profile's algorithm settings onto the live ones, key by key.
-        ///
-        /// Decoding the profile's payload straight into `Preferences` would reset every field it does not
-        /// mention to that field's default, and the default for `maxIOB` is zero.
-        private func applyPreferences(_ profileSettings: TrioProfileSettings) throws {
-            let merged = try Self.overlay(profileSettings, onto: settingsManager.preferences)
-            settingsManager.preferences = merged
+        /// What each therapy editor does after saving, so Home, the watch and Tidepool see the change.
+        private func announceTherapySettings(_ therapy: NightscoutTherapySettings) {
+            broadcaster.notify(BasalProfileObserver.self, on: .main) { $0.basalProfileDidChange(therapy.basals) }
+            broadcaster.notify(CarbRatiosObserver.self, on: .main) { $0.carbRatiosDidChange(therapy.carbRatios) }
+            broadcaster.notify(InsulinSensitivitiesObserver.self, on: .main) {
+                $0.insulinSensitivitiesDidChange(therapy.sensitivities)
+            }
+            broadcaster.notify(BGTargetsObserver.self, on: .main) { $0.bgTargetsDidChange(therapy.targets) }
+            Task { await tidepoolManager.uploadSettings() }
+        }
 
-            // Saving preferences swallows its errors the same way the therapy files do, so the result
-            // has to be read back before the switch can claim to have applied them.
-            guard let written = storage.retrieve(OpenAPS.Settings.preferences, as: Preferences.self),
-                  written == merged
-            else {
+        private func applyPreferences(_ preferences: Preferences) throws {
+            settingsManager.preferences = preferences
+            guard storage.retrieve(OpenAPS.Settings.preferences, as: Preferences.self) == preferences else {
                 throw ProfileSwitchError.preferencesNotWritten
             }
         }
 
+        /// Overlays a profile's algorithm settings onto the live ones key by key. Decoding the profile's
+        /// payload on its own would reset every missing field to its default, and `maxIOB`'s is zero.
         static func overlay(_ profileSettings: TrioProfileSettings, onto live: Preferences) throws -> Preferences {
-            let liveData = try JSONCoding.encoder.encode(live)
-            var merged = try JSONCoding.decoder.decode(JSONValue.self, from: liveData).objectValue ?? [:]
+            var merged = try JSONValue(encoding: live).objectValue ?? [:]
             for (key, value) in profileSettings.preferences {
                 merged[key] = value
             }
@@ -490,7 +531,7 @@ extension Profiles {
     }
 }
 
-enum ProfileSwitchError: LocalizedError {
+enum ProfileSwitchError: LocalizedError, CaseIterable {
     case settingsNotWritten
     case preferencesNotWritten
     case pumpWriteTimedOut
@@ -500,15 +541,15 @@ enum ProfileSwitchError: LocalizedError {
         switch self {
         case .settingsNotWritten:
             return String(
-                localized: "Trio could not save the new therapy settings. Your pump has the new basal rates but Trio is still using the old settings — check your basal rates before dosing."
+                localized: "Your pump has the new basal rates but Trio could not save the new therapy settings. Check your therapy settings before dosing."
             )
         case .pumpSettingsNotWritten:
             return String(
-                localized: "Trio could not apply the profile's insulin duration, maximum bolus and maximum basal. Nothing else was changed. Check these settings before dosing."
+                localized: "Trio could not confirm the profile's insulin duration, maximum bolus and maximum basal. Check them before dosing."
             )
         case .pumpWriteTimedOut:
             return String(
-                localized: "Your pump did not confirm the new basal rates in time. Trio kept its old settings, but the pump may still take the new rates — check your pump's basal rates before dosing, or switch again."
+                localized: "Your pump did not confirm the new basal rates in time and may still take them. Check your pump's basal rates before dosing, or switch again."
             )
         case .preferencesNotWritten:
             return String(
@@ -518,20 +559,24 @@ enum ProfileSwitchError: LocalizedError {
     }
 }
 
-/// The reply to one pump command, or the lack of one by a deadline. Settles once: whichever of the
-/// reply and the deadline comes first wins, and the other is ignored.
+/// The reply to one pump command, or its absence by a deadline. Whichever comes first settles it.
 actor PumpWriteOutcome {
+    enum Arrival { case inTime, late, duplicate }
+
     private var result: Result<Void, Error>?
     private var expired = false
     private var waiter: CheckedContinuation<Result<Void, Error>?, Never>?
 
-    /// Returns false when the reply came too late to count.
-    @discardableResult func finish(_ result: Result<Void, Error>) -> Bool {
-        guard self.result == nil, !expired else { return false }
+    @discardableResult func finish(_ result: Result<Void, Error>) -> Arrival {
+        if self.result != nil { return .duplicate }
+        if expired {
+            self.result = result
+            return .late
+        }
         self.result = result
         waiter?.resume(returning: result)
         waiter = nil
-        return true
+        return .inTime
     }
 
     func expire() {
@@ -543,8 +588,8 @@ actor PumpWriteOutcome {
 
     /// The reply, or nil if the deadline passed first.
     func wait() async -> Result<Void, Error>? {
-        if let result { return result }
         if expired { return nil }
+        if let result { return result }
         return await withCheckedContinuation { waiter = $0 }
     }
 }
