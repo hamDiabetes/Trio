@@ -155,6 +155,19 @@ extension TrioRemoteControl {
             )
         }
 
+        // These modes clamp Max IOB to 0, but the bolus calculator reads preferences unclamped.
+        let dosingMode = settings.settings.dosingMode
+        switch dosingMode {
+        case .closed,
+             .open:
+            break
+        case .basalTesting,
+             .lowGlucoseSuspend:
+            return .skip(
+                "The meal was logged. No bolus was given because Trio is in \(dosingMode.displayName), which does not bolus for carbs."
+            )
+        }
+
         let now = Date()
         let mealTime = mealDate ?? now
         let offset = mealTime.timeIntervalSince(now)

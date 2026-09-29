@@ -51,7 +51,7 @@ extension RemoteControlConfig {
                 Section(
                     header: Text("Remote Meal Bolus"),
                     footer: Text(
-                        "Choose how Trio handles a remote meal that requests its recommended bolus.\n\nOff: the meal is logged without any bolus.\n\nRequire Review: Trio calculates the bolus and sends it back to Loop Follow for you to review and confirm; Trio does not dose on its own.\n\nAuto: Trio calculates and delivers the bolus using its own bolus calculator and safety limits.\n\nThe recommended bolus is only offered when the meal is timed for now; meals scheduled for the future or backdated into the past are stored without bolusing. Default: OFF."
+                        "Choose how Trio handles a remote meal that requests its recommended bolus.\n\nOff: the meal is logged without any bolus.\n\nRequire Review: Trio calculates the bolus and sends it back to Loop Follow for you to review and confirm; Trio does not dose on its own.\n\nAuto: Trio calculates and delivers the bolus using its own bolus calculator and safety limits.\n\nThe recommended bolus is only offered when the meal is timed for now; meals scheduled for the future or backdated into the past are stored without bolusing. Trio will not calculate or deliver one while Low Glucose Suspend or Basal Testing is on. Default: OFF."
                     ),
                     content: {
                         Picker("Remote Meal Bolus", selection: $state.remoteMealBolusMode) {
