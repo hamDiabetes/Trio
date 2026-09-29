@@ -33,6 +33,13 @@ protocol APSManager {
     /// before the change landed. Concurrent calls collapse into the one already running. Algorithm
     /// errors propagate to the caller.
     func determineBasalSync() async throws
+    /// Holds off the loop while settings it reads are rewritten, so a loop cannot run against a mix of
+    /// old and new values. Returns false while a loop runs or another exclusion is held. There is no
+    /// timeout: a lapse mid-write is the torn read this exists to prevent, so the caller must bound its
+    /// own work and release on every path. `determineBasalSync()` waits for the hold, so release it
+    /// before calling that.
+    func beginLoopExclusion() async -> Bool
+    func endLoopExclusion() async
     func simulateDetermineBasal(
         simulatedCarbsAmount: Decimal,
         simulatedBolusAmount: Decimal,
@@ -77,9 +84,12 @@ enum APSError: LocalizedError {
 // MARK: - Thread-safe loop serialization
 
 /// Ensures only one loop runs at a time via actor isolation
-private actor LoopGuard {
+actor LoopGuard {
     private var isRunning = false
     private var isDeterminingStandalone = false
+    /// Held while something rewrites the settings a loop reads. Separate from `isRunning` so that
+    /// `finish()`, which only a loop calls, never has to release it.
+    private var exclusion: UUID?
     private var loopWaiters: [CheckedContinuation<Void, Never>] = []
 
     /// Atomically checks whether a new loop can start and marks it as running if so.
@@ -88,22 +98,45 @@ private actor LoopGuard {
         if lastLoopDate > lastLoopStartDate {
             guard lastLoopStartDate.addingTimeInterval(minInterval) < Date() else { return false }
         }
-        guard !isRunning else { return false }
+        guard !isRunning, exclusion == nil else { return false }
         isRunning = true
         return true
     }
 
     func finish() {
         isRunning = false
+        resumeWaitersIfIdle()
+    }
+
+    /// Returns once no loop is running and no exclusion is held.
+    func waitForLoop() async {
+        while isRunning || exclusion != nil {
+            await withCheckedContinuation { loopWaiters.append($0) }
+        }
+    }
+
+    /// Claims the guard so no loop starts until `endExclusion` is called with the returned token.
+    /// Refuses while a loop runs. Ignores the loop interval: this is not a loop.
+    func tryExclude() -> UUID? {
+        guard !isRunning, exclusion == nil else { return nil }
+        let token = UUID()
+        exclusion = token
+        return token
+    }
+
+    /// Releases the exclusion if `token` still holds it. A stale token is ignored, so an earlier
+    /// holder cannot release a later claim.
+    func endExclusion(_ token: UUID) {
+        guard exclusion == token else { return }
+        exclusion = nil
+        resumeWaitersIfIdle()
+    }
+
+    private func resumeWaitersIfIdle() {
+        guard !isRunning, exclusion == nil else { return }
         let waiters = loopWaiters
         loopWaiters.removeAll()
         waiters.forEach { $0.resume() }
-    }
-
-    /// Returns once no loop is running.
-    func waitForLoop() async {
-        guard isRunning else { return }
-        await withCheckedContinuation { loopWaiters.append($0) }
     }
 
     /// Claims the guard for a determination that runs outside the loop. Refuses while another one
@@ -147,6 +180,7 @@ final class BaseAPSManager: APSManager, Injectable {
     private var lifetime = Lifetime()
 
     private let loopGuard = LoopGuard()
+    private var loopExclusionToken: UUID?
     /// All reads/writes are dispatched onto `processQueue` so the bolus
     /// trigger sink, `cancelBolus`, and the `DoseProgressReporter`
     /// callback (which the pump manager already invokes on
@@ -594,6 +628,18 @@ final class BaseAPSManager: APSManager, Injectable {
             throw error
         }
         await loopGuard.finishStandaloneDetermination()
+    }
+
+    func beginLoopExclusion() async -> Bool {
+        guard let token = await loopGuard.tryExclude() else { return false }
+        loopExclusionToken = token
+        return true
+    }
+
+    func endLoopExclusion() async {
+        guard let token = loopExclusionToken else { return }
+        loopExclusionToken = nil
+        await loopGuard.endExclusion(token)
     }
 
     func simulateDetermineBasal(

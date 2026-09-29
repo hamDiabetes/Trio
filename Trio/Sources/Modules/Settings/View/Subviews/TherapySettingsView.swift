@@ -27,6 +27,17 @@ struct TherapySettingsView: BaseView {
             .listRowBackground(Color.chart)
 
             Section(
+                header: Text("Profiles"),
+                footer: Text(
+                    "Save your therapy and algorithm settings as a named profile in Nightscout, and switch between them."
+                ),
+                content: {
+                    Text("Saved Profiles").navigationLink(to: .profiles, from: self)
+                }
+            )
+            .listRowBackground(Color.chart)
+
+            Section(
                 header: Text("Basic Insulin Rates & Targets"),
                 content: {
                     Text("Glucose Targets").navigationLink(to: .targetsEditor, from: self)
