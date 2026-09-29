@@ -311,7 +311,7 @@ extension Profiles {
                 storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
             }
 
-            try await writeBasalSchedule(therapy.basals, name: name, switchID: marker.switchID)
+            try await writeBasalSchedule(therapy.basals, marker: marker)
             marker.pumpWriteConfirmed = true
             storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
 
@@ -349,7 +349,7 @@ extension Profiles {
 
         /// Never skipped because the stored schedule already matches: the pod's schedule cannot be read
         /// back, and the stored copy diverges whenever a write goes unacknowledged.
-        private func writeBasalSchedule(_ basals: [BasalProfileEntry], name: String, switchID: UUID?) async throws {
+        private func writeBasalSchedule(_ basals: [BasalProfileEntry], marker: ProfileSwitchMarker) async throws {
             guard let pump = apsManager.pumpManager else {
                 throw ProfileSwitchBlock.noPump
             }
@@ -370,14 +370,15 @@ extension Profiles {
                         await self.resumeDelivery(pump)
                     }
                 },
-                onLateSuccess: { self.recordLatePumpAcceptance(name: name, switchID: switchID) }
+                onLateSuccess: { self.recordLatePumpAcceptance(for: marker) }
             )
         }
 
         /// Sends one pump command and waits for its reply, but not past `timeout`.
         ///
         /// The outcome is settled before any recovery runs, so a slow recovery cannot turn a failure into
-        /// a timeout. A failure runs the recovery even when it arrives late. A late success is handed to
+        /// a timeout. A failure in time is recovered from before this returns, while the caller still
+        /// holds the loop; a late one is recovered from when it arrives. A late success is handed to
         /// `onLateSuccess`: the pump took the command after Trio stopped waiting.
         static func boundedPumpWrite(
             timeout: TimeInterval,
@@ -388,11 +389,10 @@ extension Profiles {
             let outcome = PumpWriteOutcome()
             send { result in
                 Task {
-                    let arrival = await outcome.finish(result)
-                    guard arrival != .duplicate else { return }
+                    guard await outcome.finish(result) == .late else { return }
                     switch result {
                     case .failure: await recoverAfterFailure()
-                    case .success: if arrival == .late { await onLateSuccess() }
+                    case .success: await onLateSuccess()
                     }
                 }
             }
@@ -403,7 +403,9 @@ extension Profiles {
 
             switch await outcome.wait() {
             case .success: return
-            case let .failure(error): throw error
+            case let .failure(error):
+                await recoverAfterFailure()
+                throw error
             case nil: throw ProfileSwitchError.pumpWriteTimedOut
             }
         }
@@ -411,16 +413,10 @@ extension Profiles {
         /// Updates the marker of the switch that sent the command, or recreates it if someone has cleared
         /// it since. If another switch has started, its marker is left alone and the late reply is only
         /// logged: that switch writes the whole schedule again.
-        private func recordLatePumpAcceptance(name: String, switchID: UUID?) {
-            debug(.service, "Pump accepted the \(name) basal schedule after the switch stopped waiting")
-            var marker = interruptedSwitch ?? ProfileSwitchMarker(
-                profileName: name,
-                startedAt: Date(),
-                pumpWriteConfirmed: false,
-                settingsWritten: false,
-                switchID: switchID
-            )
-            guard switchID != nil, marker.switchID == switchID else { return }
+        private func recordLatePumpAcceptance(for sent: ProfileSwitchMarker) {
+            debug(.service, "Pump accepted the \(sent.profileName) basal schedule after the switch stopped waiting")
+            var marker = interruptedSwitch ?? sent
+            guard sent.switchID != nil, marker.switchID == sent.switchID else { return }
             marker.pumpWriteConfirmed = true
             marker.pumpAcceptedAfterTimeout = true
             storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
@@ -457,6 +453,8 @@ extension Profiles {
             try await Self.boundedPumpWrite(
                 timeout: Self.pumpWriteTimeout,
                 send: { reply in
+                    // The provider's Future always sends a value or fails, so finishing without one cannot
+                    // happen; if it ever did, the deadline would report it.
                     subscription = provider.save(settings: pumpSettings).sink(
                         receiveCompletion: { if case let .failure(error) = $0 { reply(.failure(error)) } },
                         receiveValue: { reply(.success(())) }
