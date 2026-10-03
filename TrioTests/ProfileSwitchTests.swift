@@ -693,6 +693,19 @@ import Testing
         #expect(await log.entries == ["basal"])
     }
 
+    @Test("Limits the pump stored differently are reported as not written") func pumpLimitsReadBack() async throws {
+        let asked = PumpSettings(insulinActionCurve: 6, maxBolus: 5, maxBasal: 2)
+        let reported = PumpSettings(insulinActionCurve: 6, maxBolus: 3, maxBasal: 2)
+
+        await #expect(throws: ProfileSwitchError.pumpSettingsNotWritten) {
+            try await Profiles.SwitchService.savePumpSettings(asked, save: {}, stored: { reported })
+        }
+        await #expect(throws: ProfileSwitchError.pumpSettingsNotWritten) {
+            try await Profiles.SwitchService.savePumpSettings(asked, save: {}, stored: { nil })
+        }
+        try await Profiles.SwitchService.savePumpSettings(asked, save: {}, stored: { asked })
+    }
+
     // MARK: - Standalone determinations
 
     @Test("A standalone determination refuses an exclusion") func standaloneRefusesExclusion() async {

@@ -491,22 +491,37 @@ extension Profiles {
         private func writePumpSettings(_ pumpSettings: PumpSettings) async throws {
             let provider = UnitsLimitsSettings.Provider(resolver: resolver)
             var subscription: AnyCancellable?
-            try await Self.boundedPumpWrite(
-                timeout: Self.pumpWriteTimeout,
-                send: { reply in
-                    // The provider's Future always sends a value or fails, so finishing without one cannot
-                    // happen; if it ever did, the deadline would report it.
-                    subscription = provider.save(settings: pumpSettings).sink(
-                        receiveCompletion: { if case let .failure(error) = $0 { reply(.failure(error)) } },
-                        receiveValue: { reply(.success(())) }
+            try await Self.savePumpSettings(
+                pumpSettings,
+                save: {
+                    try await Self.boundedPumpWrite(
+                        timeout: Self.pumpWriteTimeout,
+                        send: { reply in
+                            // The provider's Future always sends a value or fails, so finishing without one
+                            // cannot happen; if it ever did, the deadline would report it.
+                            subscription = provider.save(settings: pumpSettings).sink(
+                                receiveCompletion: { if case let .failure(error) = $0 { reply(.failure(error)) } },
+                                receiveValue: { reply(.success(())) }
+                            )
+                        },
+                        recoverAfterFailure: {},
+                        onLateSuccess: {}
                     )
+                    subscription?.cancel()
                 },
-                recoverAfterFailure: {},
-                onLateSuccess: {}
+                stored: { self.storage.retrieve(OpenAPS.Settings.settings, as: PumpSettings.self) }
             )
-            subscription?.cancel()
+        }
 
-            guard storage.retrieve(OpenAPS.Settings.settings, as: PumpSettings.self) == pumpSettings else {
+        /// Saves the limits and reads them back. The provider stores what the pump reports, which can
+        /// differ from what was asked for, and a switch must not claim limits the pump did not take.
+        static func savePumpSettings(
+            _ pumpSettings: PumpSettings,
+            save: () async throws -> Void,
+            stored: () -> PumpSettings?
+        ) async throws {
+            try await save()
+            guard stored() == pumpSettings else {
                 throw ProfileSwitchError.pumpSettingsNotWritten
             }
         }
