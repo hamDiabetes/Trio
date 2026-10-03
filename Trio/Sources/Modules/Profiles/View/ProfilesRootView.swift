@@ -218,10 +218,11 @@ extension Profiles {
                     localized: "Insulin duration, maximum bolus and maximum basal were already changed to the profile's values."
                 )
                 : ""
-            let check =
-                String(
+            let check = marker.pumpWriteConfirmed
+                ? String(
                     localized: "A running override or temporary target may have been ended. Check your settings before dosing."
                 )
+                : String(localized: "Check your settings before dosing.")
             return [stage, limits, check].filter { !$0.isEmpty }.joined(separator: " ")
         }
 

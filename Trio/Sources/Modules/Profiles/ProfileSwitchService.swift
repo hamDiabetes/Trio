@@ -302,8 +302,6 @@ extension Profiles {
             )
             storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
 
-            try await disableActiveAdjustments()
-
             // Before the schedule, so a raised maximum basal is in place for the rates that need it.
             if let pumpSettings {
                 try await writePumpSettings(pumpSettings)
@@ -314,6 +312,10 @@ extension Profiles {
             try await writeBasalSchedule(therapy.basals, marker: marker)
             marker.pumpWriteConfirmed = true
             storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
+
+            // Only once the pump has the new schedule: an override or temp target is often protecting
+            // against a low, and a switch that fails at the pump should leave it running.
+            try await disableActiveAdjustments()
 
             try writeTherapySettings(therapy)
             marker.settingsWritten = true
