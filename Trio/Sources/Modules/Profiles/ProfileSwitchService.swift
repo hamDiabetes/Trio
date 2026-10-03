@@ -305,9 +305,11 @@ extension Profiles {
             let previousLimits = settingsManager.pumpSettings
             let writeLimits: (() async throws -> Void)? = pumpSettings.map { limits in
                 {
-                    try await self.writePumpSettings(limits)
+                    // Recorded before the attempt: a write that fails can still have stored something.
                     marker.pumpLimitsWritten = true
                     self.storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
+                    let sent = marker
+                    try await self.writePumpSettings(limits, onLateSuccess: { self.recordLateLimitWrite(for: sent) })
                 }
             }
 
@@ -463,6 +465,16 @@ extension Profiles {
             storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
         }
 
+        /// The profile's dosing limits reached the pump after the switch stopped waiting, possibly after
+        /// the previous ones were put back.
+        private func recordLateLimitWrite(for sent: ProfileSwitchMarker) {
+            debug(.service, "Pump took the \(sent.profileName) dosing limits after the switch stopped waiting")
+            var marker = interruptedSwitch ?? sent
+            guard sent.switchID != nil, marker.switchID == sent.switchID else { return }
+            marker.pumpLimitsWritten = true
+            storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
+        }
+
         private func isDeliverySuspended(_ pump: PumpManagerUI) -> Bool {
             switch pump.status.basalDeliveryState {
             case .suspended,
@@ -488,7 +500,10 @@ extension Profiles {
 
         /// Saves through the settings screen's own path, which syncs the limits to the pump and stores
         /// what the pump reports back.
-        private func writePumpSettings(_ pumpSettings: PumpSettings) async throws {
+        private func writePumpSettings(
+            _ pumpSettings: PumpSettings,
+            onLateSuccess: @escaping () async -> Void = {}
+        ) async throws {
             let provider = UnitsLimitsSettings.Provider(resolver: resolver)
             var subscription: AnyCancellable?
             try await Self.savePumpSettings(
@@ -505,7 +520,7 @@ extension Profiles {
                             )
                         },
                         recoverAfterFailure: {},
-                        onLateSuccess: {}
+                        onLateSuccess: onLateSuccess
                     )
                     subscription?.cancel()
                 },
