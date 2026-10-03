@@ -302,34 +302,73 @@ extension Profiles {
             )
             storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
 
-            // Before the schedule, so a raised maximum basal is in place for the rates that need it.
-            if let pumpSettings {
-                try await writePumpSettings(pumpSettings)
-                marker.pumpLimitsWritten = true
-                storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
+            let previousLimits = settingsManager.pumpSettings
+            let writeLimits: (() async throws -> Void)? = pumpSettings.map { limits in
+                {
+                    try await self.writePumpSettings(limits)
+                    marker.pumpLimitsWritten = true
+                    self.storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
+                }
             }
 
-            try await writeBasalSchedule(therapy.basals, marker: marker)
-            marker.pumpWriteConfirmed = true
-            storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
+            try await Self.runSteps(
+                writeLimits: writeLimits,
+                restoreLimits: {
+                    do {
+                        try await self.writePumpSettings(previousLimits)
+                        marker.pumpLimitsWritten = false
+                        self.storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
+                    } catch {
+                        debug(.service, "Could not restore the dosing limits after a failed profile switch: \(error)")
+                    }
+                },
+                writeBasal: {
+                    try await self.writeBasalSchedule(therapy.basals, marker: marker)
+                    marker.pumpWriteConfirmed = true
+                    self.storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
+                },
+                endAdjustments: { try await self.disableActiveAdjustments() },
+                writeSettings: {
+                    try self.writeTherapySettings(therapy)
+                    marker.settingsWritten = true
+                    self.storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
+                    self.announceTherapySettings(therapy)
 
-            // Only once the pump has the new schedule: an override or temp target is often protecting
-            // against a low, and a switch that fails at the pump should leave it running.
-            try await disableActiveAdjustments()
-
-            try writeTherapySettings(therapy)
-            marker.settingsWritten = true
-            storage.save(marker, as: OpenAPS.Trio.profileSwitchMarker)
-            announceTherapySettings(therapy)
-
-            if let preferences {
-                try applyPreferences(preferences)
-            }
+                    if let preferences {
+                        try self.applyPreferences(preferences)
+                    }
+                }
+            )
 
             // Autosens was derived against the settings just replaced and is otherwise reused for 30 min.
             storage.remove(OpenAPS.Settings.autosense)
 
             clearInterruptedSwitch()
+        }
+
+        /// Applies a switch's parts in order. Dosing limits go first, so pumps that check basal rates
+        /// against the maximum basal accept the new schedule. Overrides and temp targets end only once the
+        /// pump has the new schedule, since one is often protecting against a low. If any part fails after
+        /// the limits may have changed, the previous limits are put back: a switch that fails at the pump
+        /// must not leave a higher maximum bolus or a different insulin duration in force.
+        static func runSteps(
+            writeLimits: (() async throws -> Void)?,
+            restoreLimits: () async -> Void,
+            writeBasal: () async throws -> Void,
+            endAdjustments: () async throws -> Void,
+            writeSettings: () async throws -> Void
+        ) async throws {
+            do {
+                try await writeLimits?()
+                try await writeBasal()
+                try await endAdjustments()
+                try await writeSettings()
+            } catch {
+                if writeLimits != nil {
+                    await restoreLimits()
+                }
+                throw error
+            }
         }
 
         /// Ends any running override and temp target. Through the adjustment manager, because ending a

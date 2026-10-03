@@ -647,6 +647,52 @@ import Testing
         #expect(await !ended.value)
     }
 
+    // MARK: - Order of a switch
+
+    private func runSteps(_ log: StepLog, withLimits: Bool = true, failing: String? = nil) async throws {
+        func step(_ name: String) async throws {
+            await log.append(name)
+            if name == failing { throw URLError(.cannotConnectToHost) }
+        }
+        try await Profiles.SwitchService.runSteps(
+            writeLimits: withLimits ? { try await step("limits") } : nil,
+            restoreLimits: { await log.append("restore") },
+            writeBasal: { try await step("basal") },
+            endAdjustments: { try await step("adjustments") },
+            writeSettings: { try await step("settings") }
+        )
+    }
+
+    @Test("A switch writes limits, then the schedule, then ends adjustments") func stepsInOrder() async throws {
+        let log = StepLog()
+        try await runSteps(log)
+        #expect(await log.entries == ["limits", "basal", "adjustments", "settings"])
+    }
+
+    @Test("A failed schedule write restores the limits and ends nothing") func basalFailureRestoresLimits() async {
+        let log = StepLog()
+        await #expect(throws: URLError.self) { try await runSteps(log, failing: "basal") }
+        #expect(await log.entries == ["limits", "basal", "restore"])
+    }
+
+    @Test("A failed limit write is restored and goes no further") func limitFailureRestores() async {
+        let log = StepLog()
+        await #expect(throws: URLError.self) { try await runSteps(log, failing: "limits") }
+        #expect(await log.entries == ["limits", "restore"])
+    }
+
+    @Test("A failure after the schedule write still restores the limits") func lateFailureRestoresLimits() async {
+        let log = StepLog()
+        await #expect(throws: URLError.self) { try await runSteps(log, failing: "settings") }
+        #expect(await log.entries == ["limits", "basal", "adjustments", "settings", "restore"])
+    }
+
+    @Test("A profile without limits has none to restore") func noLimitsNoRestore() async {
+        let log = StepLog()
+        await #expect(throws: URLError.self) { try await runSteps(log, withLimits: false, failing: "basal") }
+        #expect(await log.entries == ["basal"])
+    }
+
     // MARK: - Standalone determinations
 
     @Test("A standalone determination refuses an exclusion") func standaloneRefusesExclusion() async {
@@ -679,6 +725,11 @@ private actor Counter {
 private actor ResumeFlag {
     private(set) var value = false
     func set() { value = true }
+}
+
+private actor StepLog {
+    private(set) var entries: [String] = []
+    func append(_ entry: String) { entries.append(entry) }
 }
 
 private final class CapturedReply: @unchecked Sendable {
