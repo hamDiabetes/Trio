@@ -485,7 +485,7 @@ import Testing
     @Test("A blocked switch explains itself") func blocksHaveMessages() {
         let blocks: [ProfileSwitchBlock] = [
             .noPump, .pumpSuspended, .bolusInProgress, .looping,
-            .reducedTempBasalRunning, .unsupportedBasalRate(0.325), .unreadableSettings
+            .reducedTempBasalRunning, .manualTempBasalRunning, .unsupportedBasalRate(0.325), .unreadableSettings
         ]
 
         for block in blocks {
@@ -579,12 +579,16 @@ import Testing
         scheduled: Decimal? = 0.45,
         suspended: Bool = false,
         bolusing: Bool = false,
-        looping: Bool = false
+        looping: Bool = false,
+        openLoop: Bool = false,
+        manual: Bool = false
     ) -> ProfileSwitchPreflight {
         ProfileSwitchPreflight(
             suspended: suspended,
             bolusInProgress: bolusing,
             looping: looping,
+            automationOff: openLoop,
+            manualTempBasal: manual,
             tempBasalRate: temp,
             scheduledRate: scheduled
         )
@@ -599,16 +603,29 @@ import Testing
         )
     }
 
-    @Test("A temp basal below the schedule blocks a switch, and one at or above it does not") func reducedTempBlocks() {
-        #expect(preflightBlocks(preflight(temp: 0)).contains(.reducedTempBasalRunning))
-        #expect(preflightBlocks(preflight(temp: 0.4)).contains(.reducedTempBasalRunning))
-        #expect(!preflightBlocks(preflight(temp: 0.45)).contains(.reducedTempBasalRunning))
-        #expect(!preflightBlocks(preflight(temp: 1.2)).contains(.reducedTempBasalRunning))
-        #expect(!preflightBlocks(preflight()).contains(.reducedTempBasalRunning))
+    @Test("With the loop running, a temp basal does not block a switch") func loopTempDoesNotBlock() {
+        for temp: Decimal in [0, 0.13, 0.45, 1.2] {
+            #expect(preflightBlocks(preflight(temp: temp)).isEmpty)
+        }
+        #expect(preflightBlocks(preflight(temp: 0, scheduled: nil)).isEmpty)
     }
 
-    @Test("A running temp basal blocks when the schedule cannot be read") func unknownScheduleBlocks() {
-        #expect(preflightBlocks(preflight(temp: 1.2, scheduled: nil)).contains(.reducedTempBasalRunning))
+    @Test("In Open Loop a temp below the schedule blocks, and one at or above it does not") func openLoopReducedTempBlocks() {
+        #expect(preflightBlocks(preflight(temp: 0, openLoop: true)) == [.reducedTempBasalRunning])
+        #expect(preflightBlocks(preflight(temp: 0.4, openLoop: true)) == [.reducedTempBasalRunning])
+        #expect(preflightBlocks(preflight(temp: 0.45, openLoop: true)).isEmpty)
+        #expect(preflightBlocks(preflight(temp: 1.2, openLoop: true)).isEmpty)
+        #expect(preflightBlocks(preflight(openLoop: true)).isEmpty)
+    }
+
+    @Test("In Open Loop a temp blocks when the schedule cannot be read") func unknownScheduleBlocks() {
+        #expect(preflightBlocks(preflight(temp: 1.2, scheduled: nil, openLoop: true)) == [.reducedTempBasalRunning])
+    }
+
+    @Test("A temp basal set on the pump blocks in any mode") func manualTempBlocks() {
+        #expect(preflightBlocks(preflight(temp: 1.2, manual: true)) == [.manualTempBasalRunning])
+        #expect(preflightBlocks(preflight(temp: 0, openLoop: true, manual: true)) == [.manualTempBasalRunning])
+        #expect(preflightBlocks(preflight(manual: true)).isEmpty)
     }
 
     @Test("Suspension, a bolus and a running loop each block a switch") func pumpStateBlocks() {

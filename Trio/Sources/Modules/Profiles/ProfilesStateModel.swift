@@ -18,6 +18,8 @@ extension Profiles {
 
         var pendingSwitch: Item?
         var pendingBlocks: [ProfileSwitchBlock] = []
+        /// A running temp basal the switch will cancel and the next loop will replace.
+        var pendingTempBasal: Decimal?
         var switchInProgress = false
         /// A switch that did not finish. Kept until a switch succeeds or a person says they have checked
         /// the pump, because the pump and Trio may be running different basal rates until then.
@@ -52,6 +54,7 @@ extension Profiles {
             do {
                 let therapy = try NightscoutProfileConverter.therapySettings(from: item.profile)
                 pendingBlocks = await switchService.blocks(for: therapy, profileSettings: item.trioSettings)
+                pendingTempBasal = switchService.tempBasalToReplace()
                 pendingChanges = ProfileSwitchPreview(
                     incoming: therapy,
                     current: await provider.currentTherapySettings(),
