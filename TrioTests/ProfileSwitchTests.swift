@@ -527,6 +527,15 @@ import Testing
         #expect(await loopGuard.tryExclude() != nil)
     }
 
+    @Test("A waived interval lets a loop start, but not past an exclusion") func waivedIntervalStillHonoursExclusion() async throws {
+        let justNow = Date()
+        let held = LoopGuard()
+        let token = try #require(await held.tryExclude())
+        #expect(await !held.tryStart(minInterval: 0, lastLoopDate: justNow, lastLoopStartDate: justNow.addingTimeInterval(-1)))
+        await held.endExclusion(token)
+        #expect(await held.tryStart(minInterval: 0, lastLoopDate: justNow, lastLoopStartDate: justNow.addingTimeInterval(-1)))
+    }
+
     @Test("A stale token cannot release a later exclusion") func staleTokenIgnored() async throws {
         let loopGuard = LoopGuard()
         let first = try #require(await loopGuard.tryExclude())

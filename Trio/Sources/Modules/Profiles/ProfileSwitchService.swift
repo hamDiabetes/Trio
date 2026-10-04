@@ -258,14 +258,17 @@ extension Profiles {
                 )
             }
 
-            // After the release, since this waits for it. It recalculates without enacting; the nudge
-            // below asks for a loop the way the Home screen does, subject to the loop interval.
+            // After the release, since this waits for it. It recalculates without enacting; the loop
+            // nudged below is what enacts.
             do {
                 try await apsManager.determineBasalSync()
             } catch {
                 debug(.apsManager, "Recalculation after a profile switch failed: \(error)")
             }
+            // The schedule write cancelled any running temp basal, so this loop is what modulates delivery
+            // again. It cannot wait out the loop interval.
             apsManager.markNextLoopUserInitiated()
+            apsManager.markNextLoopIgnoringInterval()
             apsManager.heartbeat(date: Date())
         }
 

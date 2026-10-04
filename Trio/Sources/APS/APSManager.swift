@@ -13,6 +13,10 @@ protocol APSManager {
     /// usual dwell threshold — when the user explicitly asks for a loop,
     /// they want feedback even if the underlying error is "transient".
     func markNextLoopUserInitiated()
+    /// Let the next loop attempt run even if the last one started less than the loop interval ago.
+    /// For a loop that has to act on settings that just changed; it still waits its turn behind a
+    /// running loop or a held exclusion, and goes through the same checks as any other loop.
+    func markNextLoopIgnoringInterval()
     func enactBolus(amount: Double, isSMB: Bool, callback: ((Bool, String) -> Void)?) async
     var pumpManager: PumpManagerUI? { get set }
     var bluetoothManager: BluetoothStateManager? { get }
@@ -345,6 +349,8 @@ final class BaseAPSManager: APSManager, Injectable {
             // user didn't request.
             let userInitiated = self.nextLoopUserInitiated
             self.nextLoopUserInitiated = false
+            let ignoresInterval = self.nextLoopIgnoresInterval
+            self.nextLoopIgnoresInterval = false
 
             // Don't try to run a loop while pump setup / pod pairing is in
             // progress — `verifyStatus` would throw `invalidPumpState("Pump
@@ -359,7 +365,7 @@ final class BaseAPSManager: APSManager, Injectable {
             // Atomic check-and-set via actor — eliminates the race between
             // checking isLooping.value and sending isLooping(true).
             guard await loopGuard.tryStart(
-                minInterval: Config.loopInterval,
+                minInterval: ignoresInterval ? 0 : Config.loopInterval,
                 lastLoopDate: lastLoopDate,
                 lastLoopStartDate: lastLoopStartDate
             ) else {
@@ -1370,6 +1376,14 @@ final class BaseAPSManager: APSManager, Injectable {
 
     func markNextLoopUserInitiated() {
         nextLoopUserInitiated = true
+    }
+
+    /// Set by `markNextLoopIgnoringInterval()`, consumed on the next entry into `loop()` like
+    /// `nextLoopUserInitiated`.
+    @SyncAccess private var nextLoopIgnoresInterval: Bool = false
+
+    func markNextLoopIgnoringInterval() {
+        nextLoopIgnoresInterval = true
     }
 
     private func processError(_ error: Error) {
