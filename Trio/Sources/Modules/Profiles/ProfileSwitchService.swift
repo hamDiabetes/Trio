@@ -15,6 +15,7 @@ enum ProfileSwitchBlock: LocalizedError, Equatable, Hashable {
     case bolusInProgress
     case looping
     case reducedTempBasalRunning
+    case manualTempBasalRunning
     case unsupportedBasalRate(Decimal)
     case pumpLimitOutOfRange(ProfilePumpLimit, Decimal)
     case basalAboveMaxBasal(rate: Decimal, maxBasal: Decimal)
@@ -32,7 +33,11 @@ enum ProfileSwitchBlock: LocalizedError, Equatable, Hashable {
             return String(localized: "Trio is running a loop right now. Try again in a moment.")
         case .reducedTempBasalRunning:
             return String(
-                localized: "A reduced temporary basal is running, which usually means Trio is protecting against a low. Switching now would cancel it and resume full basal delivery. Wait for it to end."
+                localized: "A reduced temporary basal is running and Trio is in Open Loop, so nothing would set a new one after the switch. Wait for it to end, or cancel it first."
+            )
+        case .manualTempBasalRunning:
+            return String(
+                localized: "A temporary basal set on the pump is running. Switching would cancel it. Cancel it on the pump first, or wait for it to end."
             )
         case let .unsupportedBasalRate(rate):
             return String(localized: "This profile has a basal rate of \(rate) U/hr, which your pump cannot deliver.")
@@ -114,6 +119,10 @@ struct ProfileSwitchPreflight {
     var suspended = false
     var bolusInProgress = false
     var looping = false
+    /// Open Loop: nothing sets a new temp basal after the switch cancels one.
+    var automationOff = false
+    /// A temp basal someone set on the pump, which a loop would not replace with its own.
+    var manualTempBasal = false
     var tempBasalRate: Decimal?
     /// Nil when the running schedule cannot be read.
     var scheduledRate: Decimal?
@@ -159,6 +168,13 @@ extension Profiles {
             return blocks
         }
 
+        /// The temp basal a switch would cancel and the loop would then replace, for the confirmation.
+        func tempBasalToReplace() -> Decimal? {
+            let preflight = currentPreflight()
+            guard !preflight.automationOff, !preflight.manualTempBasal else { return nil }
+            return preflight.tempBasalRate
+        }
+
         private func currentPreflight() -> ProfileSwitchPreflight {
             guard let pump = apsManager.pumpManager else {
                 return ProfileSwitchPreflight(pumpPresent: false)
@@ -167,6 +183,8 @@ extension Profiles {
                 suspended: apsManager.isSuspended,
                 bolusInProgress: apsManager.bolusProgress.value != nil,
                 looping: apsManager.isLooping.value,
+                automationOff: settingsManager.settings.dosingMode.automation == .off,
+                manualTempBasal: apsManager.isManualTempBasal,
                 supportedBasalRates: pump.supportedBasalRates.map { Decimal($0) }
             )
             if case let .tempBasal(dose) = pump.status.basalDeliveryState {
@@ -191,10 +209,16 @@ extension Profiles {
             if preflight.bolusInProgress { blocks.append(.bolusInProgress) }
             if preflight.looping { blocks.append(.looping) }
 
-            // A temp below the schedule is usually Trio holding back against a low. Writing a schedule
-            // cancels it and nothing restores it until the next loop. When the schedule cannot be read,
-            // any running temp is treated as one.
-            if let temp = preflight.tempBasalRate, temp < (preflight.scheduledRate ?? .greatestFiniteMagnitude) {
+            // Writing a schedule cancels a running temp basal. With the loop running, the loop after the
+            // switch sets a new one, as it does after a basal edit made by hand, so that is not a reason
+            // to refuse. Two cases are: a temp set on the pump on purpose, and a reduced temp in Open
+            // Loop, where nothing would replace it. When the schedule cannot be read, any running temp is
+            // treated as reduced.
+            if preflight.tempBasalRate != nil, preflight.manualTempBasal {
+                blocks.append(.manualTempBasalRunning)
+            } else if preflight.automationOff, let temp = preflight.tempBasalRate,
+                      temp < (preflight.scheduledRate ?? .greatestFiniteMagnitude)
+            {
                 blocks.append(.reducedTempBasalRunning)
             }
 

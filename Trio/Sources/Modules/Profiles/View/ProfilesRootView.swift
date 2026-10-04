@@ -285,6 +285,12 @@ extension Profiles {
 
                         Section(header: Text("Also")) {
                             Text("Any running override or temporary target will be cancelled.")
+                            if let rate = state.pendingTempBasal {
+                                Text(
+                                    "A temporary basal of \(rate) U/hr is running. Switching cancels it, and Trio runs a loop straight after to set a new one with the new settings."
+                                )
+                                .foregroundStyle(.orange)
+                            }
                             if let marker = state.interrupted {
                                 Text(
                                     "The last switch, to \(marker.profileName), did not finish. This switch rewrites your pump's basal schedule."
