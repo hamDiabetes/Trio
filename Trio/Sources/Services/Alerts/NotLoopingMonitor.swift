@@ -28,6 +28,7 @@ final class NotLoopingMonitor: Injectable {
     @Injected() private var broadcaster: Broadcaster!
 
     private var lastLoopDate = Date()
+    private var alertsStore = DeviceAlertsStore.shared
 
     /// Minutes of staleness for each Time-Sensitive warning step.
     private static let warningMinutes: [Int] = [20, 40, 60, 80, 100]
@@ -65,8 +66,13 @@ final class NotLoopingMonitor: Injectable {
     /// Publisher-only seam for tests: assigns the alert manager directly and
     /// subscribes to a supplied loop-date publisher, avoiding the need to stub
     /// the full `APSManager` protocol.
-    init(loopDates: AnyPublisher<Date, Never>, trioAlertManager: TrioAlertManager) {
+    init(
+        loopDates: AnyPublisher<Date, Never>,
+        trioAlertManager: TrioAlertManager,
+        alertsStore: DeviceAlertsStore = .shared
+    ) {
         self.trioAlertManager = trioAlertManager
+        self.alertsStore = alertsStore
         subscribe(to: loopDates)
     }
 
@@ -77,9 +83,19 @@ final class NotLoopingMonitor: Injectable {
                 self?.rescheduleAlarm()
             }
             .store(in: &subscriptions)
+
+        // Re-arm from the same anchor when the mode changes, so a new choice
+        // applies now rather than at the next loop.
+        alertsStore.$notLoopingAlarm
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] mode in self?.rescheduleAlarm(mode: mode) }
+            .store(in: &subscriptions)
     }
 
-    private func rescheduleAlarm() {
+    /// `mode` is passed by the store subscription because `@Published` emits
+    /// before the property itself is updated.
+    private func rescheduleAlarm(mode: NotLoopingAlarmMode? = nil) {
         // Retract first — clears pending UN, modal timer, and throttler so the
         // next issueAlert isn't blocked by 5-min duplicate suppression.
         for identifier in Self.allIDs {
@@ -98,10 +114,17 @@ final class NotLoopingMonitor: Injectable {
         else { return }
 
         let now = Date()
-        for (index, minutes) in Self.warningMinutes.enumerated() {
-            issue(identifier: Self.warningID(index + 1), after: minutes, level: .timeSensitive, now: now)
+        switch mode ?? alertsStore.notLoopingAlarm {
+        case .escalating:
+            for (index, minutes) in Self.warningMinutes.enumerated() {
+                issue(identifier: Self.warningID(index + 1), after: minutes, level: .timeSensitive, now: now)
+            }
+            issue(identifier: Self.alertID, after: Self.criticalMinutes, level: .critical, now: now)
+        case let .critical(afterMinutes):
+            issue(identifier: Self.alertID, after: afterMinutes, level: .critical, now: now)
+        case .off:
+            break
         }
-        issue(identifier: Self.alertID, after: Self.criticalMinutes, level: .critical, now: now)
     }
 
     /// The catalog decides the interruption level for `trio.aps` alerts, so the
