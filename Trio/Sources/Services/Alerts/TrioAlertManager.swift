@@ -263,11 +263,16 @@ final class BaseTrioAlertManager: TrioAlertManager, Injectable {
             self.liveAlerts[effective.identifier] = effective
         }
         recordIssued(effective)
-        let muted = muter.shouldMute(at: now)
+        // Judged at fire time: a delayed critical armed during a snooze must
+        // still sound if it fires after the snooze ends.
+        let muted = muter.shouldMute(at: fireDate)
         modalScheduler.schedule(effective)
         // AlarmKit sounds critical alerts itself; posting the notification with
-        // a sound too would play the tone twice, at once.
+        // a sound too would play the tone twice, at once. Only for immediate
+        // alerts: a delayed one reaches AlarmKit through an in-process timer,
+        // which never fires if iOS has suspended Trio.
         let alarmKitWillSound = alarmKitAvailable
+            && fireDate == now
             && effective.interruptionLevel == .critical
             && effective.sound?.filename != nil
             && !muted

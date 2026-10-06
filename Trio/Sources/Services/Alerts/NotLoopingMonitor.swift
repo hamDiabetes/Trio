@@ -121,7 +121,9 @@ final class NotLoopingMonitor: Injectable {
             }
             issue(identifier: Self.alertID, after: Self.criticalMinutes, level: .critical, now: now)
         case let .critical(afterMinutes):
-            issue(identifier: Self.alertID, after: afterMinutes, level: .critical, now: now)
+            // A mode change mid-outage can land past the new delay; fire now
+            // rather than leave nothing armed.
+            issue(identifier: Self.alertID, after: afterMinutes, level: .critical, now: now, fireIfPast: mode != nil)
         case .off:
             break
         }
@@ -133,9 +135,16 @@ final class NotLoopingMonitor: Injectable {
     /// Steps are measured from the last successful loop, not from `now`, so a
     /// mid-window re-arm keeps the original schedule. A step whose moment has
     /// already passed is skipped rather than fired late.
-    private func issue(identifier: Alert.Identifier, after minutes: Int, level: Alert.InterruptionLevel, now: Date) {
+    private func issue(
+        identifier: Alert.Identifier,
+        after minutes: Int,
+        level: Alert.InterruptionLevel,
+        now: Date,
+        fireIfPast: Bool = false
+    ) {
         let fireDate = lastLoopDate.addingTimeInterval(TimeInterval(minutes * 60))
-        let remaining = fireDate.timeIntervalSince(now)
+        var remaining = fireDate.timeIntervalSince(now)
+        if remaining <= 0, fireIfPast { remaining = 1 }
         guard remaining > 0 else { return }
         let content = Alert.Content(
             title: String(localized: "Trio Not Active"),
