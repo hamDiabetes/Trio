@@ -146,4 +146,75 @@ final class SpyAlertManager: TrioAlertManager {
             #expect(alert.trigger != .immediate)
         }
     }
+
+    private func isolatedStore(_ mode: NotLoopingAlarmMode) -> DeviceAlertsStore {
+        let defaults = UserDefaults(suiteName: "NotLoopingMonitorTests.\(UUID().uuidString)")!
+        let store = DeviceAlertsStore(defaults: defaults)
+        store.notLoopingAlarm = mode
+        return store
+    }
+
+    @Test("A single Critical mode arms one alarm at the chosen delay") func singleCriticalMode() {
+        let subject = PassthroughSubject<Date, Never>()
+        let spy = SpyAlertManager()
+        let monitor = NotLoopingMonitor(
+            loopDates: subject.eraseToAnyPublisher(),
+            trioAlertManager: spy,
+            alertsStore: isolatedStore(.critical(afterMinutes: 45))
+        )
+        subject.send(Date())
+
+        #expect(spy.issuedAlerts.count == 1)
+        #expect(spy.issuedAlerts.first?.identifier == criticalID)
+        #expect(spy.issuedAlerts.first?.interruptionLevel == .critical)
+        if let trigger = spy.issuedAlerts.first?.trigger { expectDelay(trigger, 45) }
+        #expect(spy.retractedIdentifiers.count == 6)
+        _ = monitor
+    }
+
+    @Test("Off arms nothing and still retracts every step") func offMode() {
+        let subject = PassthroughSubject<Date, Never>()
+        let spy = SpyAlertManager()
+        let monitor = NotLoopingMonitor(
+            loopDates: subject.eraseToAnyPublisher(),
+            trioAlertManager: spy,
+            alertsStore: isolatedStore(.off)
+        )
+        subject.send(Date())
+
+        #expect(spy.issuedAlerts.isEmpty)
+        #expect(Set(spy.retractedIdentifiers) == Set([criticalID] + (1 ... 5).map(warningID)))
+        _ = monitor
+    }
+
+    @Test("Changing the mode re-arms at once with the new choice") func modeChangeReArms() {
+        let subject = PassthroughSubject<Date, Never>()
+        let spy = SpyAlertManager()
+        let store = isolatedStore(.escalating)
+        let monitor = NotLoopingMonitor(
+            loopDates: subject.eraseToAnyPublisher(),
+            trioAlertManager: spy,
+            alertsStore: store
+        )
+        subject.send(Date())
+        #expect(spy.issuedAlerts.count == 6)
+
+        store.notLoopingAlarm = .off
+        #expect(spy.issuedAlerts.count == 6)
+        #expect(spy.retractedIdentifiers.count == 12)
+
+        store.notLoopingAlarm = .critical(afterMinutes: 90)
+        #expect(spy.issuedAlerts.count == 7)
+        if let trigger = spy.issuedAlerts.last?.trigger { expectDelay(trigger, 90) }
+        _ = monitor
+    }
+
+    @Test("The mode survives a reload from the same defaults") func modePersists() {
+        let defaults = UserDefaults(suiteName: "NotLoopingMonitorTests.\(UUID().uuidString)")!
+        DeviceAlertsStore(defaults: defaults).notLoopingAlarm = .critical(afterMinutes: 60)
+        #expect(DeviceAlertsStore(defaults: defaults).notLoopingAlarm == .critical(afterMinutes: 60))
+
+        let fresh = UserDefaults(suiteName: "NotLoopingMonitorTests.\(UUID().uuidString)")!
+        #expect(DeviceAlertsStore(defaults: fresh).notLoopingAlarm == .escalating)
+    }
 }

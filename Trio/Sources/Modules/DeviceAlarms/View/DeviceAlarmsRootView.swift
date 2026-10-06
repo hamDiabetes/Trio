@@ -68,6 +68,19 @@ extension DeviceAlarms {
                     }.listRowBackground(Color.chart)
                 }
 
+                Section(
+                    header: Text("Trio Not Looping"),
+                    footer: Text(notLoopingFooter)
+                ) {
+                    Picker("Alarm", selection: $store.notLoopingAlarm) {
+                        Text("Escalating").tag(NotLoopingAlarmMode.escalating)
+                        ForEach(NotLoopingAlarmMode.criticalDelayChoices, id: \.self) { minutes in
+                            Text("Critical after \(minutes) min").tag(NotLoopingAlarmMode.critical(afterMinutes: minutes))
+                        }
+                        Text("Off").tag(NotLoopingAlarmMode.off)
+                    }
+                }.listRowBackground(Color.chart)
+
                 Section {
                     Text("Day & Night Windows")
                         .foregroundStyle(Color.accentColor)
@@ -188,6 +201,21 @@ extension DeviceAlarms {
         }
 
         // MARK: - Helpers
+
+        private var notLoopingFooter: String {
+            switch store.notLoopingAlarm {
+            case .escalating:
+                return String(
+                    localized: "Time-Sensitive warnings at 20, 40, 60, 80 and 100 minutes without a loop, then a Critical alarm at 120."
+                )
+            case let .critical(minutes):
+                return String(localized: "One Critical alarm after \(minutes) minutes without a loop. No warnings before it.")
+            case .off:
+                return String(
+                    localized: "No alarm when Trio stops looping. A pod or Bluetooth failure can stop insulin delivery while CGM readings still arrive."
+                )
+            }
+        }
 
         private func windowLabel(for option: ActiveOption) -> String {
             switch option {

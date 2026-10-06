@@ -14,21 +14,25 @@ final class DeviceAlertsStore: ObservableObject {
     @Published var configs: [DeviceAlertSeverityConfig]
     /// Per-tier snooze expirations keyed by `DeviceAlertSeverity.rawValue`.
     @Published var tierSnoozes: [String: Date]
+    @Published var notLoopingAlarm: NotLoopingAlarmMode
 
     private let defaults: UserDefaults
     private let configsKey: String
     private let snoozesKey: String
+    private let notLoopingKey: String
 
     private var subscriptions = Set<AnyCancellable>()
 
     init(
         defaults: UserDefaults = .standard,
         configsKey: String = "trio.deviceAlertSeverityConfigs.v1",
-        snoozesKey: String = "trio.deviceAlertTierSnoozes.v1"
+        snoozesKey: String = "trio.deviceAlertTierSnoozes.v1",
+        notLoopingKey: String = "trio.notLoopingAlarmMode.v1"
     ) {
         self.defaults = defaults
         self.configsKey = configsKey
         self.snoozesKey = snoozesKey
+        self.notLoopingKey = notLoopingKey
         let loaded = Self.decode([DeviceAlertSeverityConfig].self, from: defaults, key: configsKey) ?? []
         var seeded = loaded
         for severity in DeviceAlertSeverity.allCases
@@ -39,6 +43,7 @@ final class DeviceAlertsStore: ObservableObject {
         configs = Self.sorted(seeded)
         let snoozes = Self.decode([String: Date].self, from: defaults, key: snoozesKey) ?? [:]
         tierSnoozes = snoozes.filter { $0.value > Date() }
+        notLoopingAlarm = Self.decode(NotLoopingAlarmMode.self, from: defaults, key: notLoopingKey) ?? .escalating
         bind()
     }
 
@@ -67,6 +72,11 @@ final class DeviceAlertsStore: ObservableObject {
             .dropFirst()
             .removeDuplicates()
             .sink { [weak self] value in self?.encode(value, to: self?.snoozesKey ?? "") }
+            .store(in: &subscriptions)
+        $notLoopingAlarm
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] value in self?.encode(value, to: self?.notLoopingKey ?? "") }
             .store(in: &subscriptions)
     }
 
@@ -175,4 +185,15 @@ final class DeviceAlertsStore: ObservableObject {
         guard !key.isEmpty, let data = try? JSONEncoder().encode(value) else { return }
         defaults.set(data, forKey: key)
     }
+}
+
+/// How the not-looping watchdog alerts. `.escalating` is the default ladder
+/// in `NotLoopingMonitor`; `.critical` replaces it with a single Critical
+/// alarm at the chosen delay; `.off` arms nothing.
+enum NotLoopingAlarmMode: Codable, Equatable, Hashable {
+    case escalating
+    case critical(afterMinutes: Int)
+    case off
+
+    static let criticalDelayChoices = [20, 30, 45, 60, 90, 120]
 }
