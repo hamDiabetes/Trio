@@ -71,7 +71,11 @@ final class SpyAlertManager: TrioAlertManager {
     private func armLadder() -> SpyAlertManager {
         let subject = PassthroughSubject<Date, Never>()
         let spy = SpyAlertManager()
-        let monitor = NotLoopingMonitor(loopDates: subject.eraseToAnyPublisher(), trioAlertManager: spy)
+        let monitor = NotLoopingMonitor(
+            loopDates: subject.eraseToAnyPublisher(),
+            trioAlertManager: spy,
+            alertsStore: isolatedStore(.escalating)
+        )
         subject.send(Date())
         _ = monitor // retain through the synchronous send
         return spy
@@ -119,7 +123,11 @@ final class SpyAlertManager: TrioAlertManager {
     @Test("A recovered loop re-arms the whole ladder again") func reArmsOnEachSuccess() {
         let subject = PassthroughSubject<Date, Never>()
         let spy = SpyAlertManager()
-        let monitor = NotLoopingMonitor(loopDates: subject.eraseToAnyPublisher(), trioAlertManager: spy)
+        let monitor = NotLoopingMonitor(
+            loopDates: subject.eraseToAnyPublisher(),
+            trioAlertManager: spy,
+            alertsStore: isolatedStore(.escalating)
+        )
 
         subject.send(Date())
         subject.send(Date())
@@ -206,6 +214,29 @@ final class SpyAlertManager: TrioAlertManager {
         store.notLoopingAlarm = .critical(afterMinutes: 90)
         #expect(spy.issuedAlerts.count == 7)
         if let trigger = spy.issuedAlerts.last?.trigger { expectDelay(trigger, 90) }
+        _ = monitor
+    }
+
+    @Test("Switching to a delay that has already passed fires now") func pastDueModeChangeFires() {
+        let subject = PassthroughSubject<Date, Never>()
+        let spy = SpyAlertManager()
+        let store = isolatedStore(.escalating)
+        let monitor = NotLoopingMonitor(
+            loopDates: subject.eraseToAnyPublisher(),
+            trioAlertManager: spy,
+            alertsStore: store
+        )
+        subject.send(Date().addingTimeInterval(-30 * 60))
+        let armed = spy.issuedAlerts.count
+
+        store.notLoopingAlarm = .critical(afterMinutes: 20)
+        #expect(spy.issuedAlerts.count == armed + 1)
+        #expect(spy.issuedAlerts.last?.identifier == criticalID)
+        if case let .delayed(interval)? = spy.issuedAlerts.last?.trigger {
+            #expect(interval <= 1)
+        } else {
+            Issue.record("expected a delayed trigger")
+        }
         _ = monitor
     }
 
