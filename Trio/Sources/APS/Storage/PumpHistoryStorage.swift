@@ -16,6 +16,7 @@ protocol PumpHistoryStorage {
     /// so the caller can delete the now-withdrawn treatments remotely.
     @discardableResult func storePumpEvents(_ events: [NewPumpEvent], replacePendingEvents: Bool) async throws -> [String]
     func storeExternalInsulinEvent(amount: Decimal, timestamp: Date) async
+    func recordInsertionSite(_ site: String, podActivatedAt: Date?) async
     func getPumpHistoryNotYetUploadedToNightscout() async throws -> [NightscoutTreatment]
     func getPumpHistoryNotYetUploadedToHealth() async throws -> [PumpHistoryEvent]
     func getPumpHistoryNotYetUploadedToTidepool() async throws -> [PumpHistoryEvent]
@@ -34,6 +35,9 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
     }
 
     let makeContext: () -> NSManagedObjectContext
+
+    /// How long after a site change its insertion site may still be attached.
+    static let insertionSiteWindow: TimeInterval = 30 * 60
 
     init(resolver: Resolver, contextProvider: (() -> NSManagedObjectContext)? = nil) {
         makeContext = contextProvider ?? { CoreDataStack.shared.newTaskContext() }
@@ -334,6 +338,61 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
         }
     }
 
+    /// Attaches the insertion site to the newest site change without one since the pod was paired,
+    /// retrying briefly in case the pod change is still being stored. Only the note changes, so the
+    /// algorithm's view of the site change is untouched.
+    func recordInsertionSite(_ site: String, podActivatedAt: Date?) async {
+        await recordInsertionSite(site, podActivatedAt: podActivatedAt, retryDelays: [5, 10])
+    }
+
+    func recordInsertionSite(_ site: String, podActivatedAt: Date?, retryDelays: [TimeInterval]) async {
+        for delay in [0] + retryDelays {
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+            if await attachInsertionSite(site, podActivatedAt: podActivatedAt) {
+                updateSubject.send(())
+                return
+            }
+        }
+        debug(.coreData, "No site change found for insertion site \(site), not recorded")
+    }
+
+    private func attachInsertionSite(_ site: String, podActivatedAt: Date?) async -> Bool {
+        let context = makeContext()
+        context.name = "recordInsertionSite"
+        // a minute of slack for the pod's own activation clock
+        let earliest = max(
+            Date().addingTimeInterval(-Self.insertionSiteWindow),
+            podActivatedAt?.addingTimeInterval(-60) ?? .distantPast
+        )
+        return await context.perform {
+            let request = PumpEventStored.fetchRequest() as NSFetchRequest<PumpEventStored>
+            request.predicate = NSPredicate(
+                format: "type == %@ AND note == nil AND timestamp >= %@",
+                PumpEvent.siteChange.rawValue,
+                earliest as NSDate
+            )
+            request.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: false)]
+            request.fetchLimit = 1
+            do {
+                guard let event = try context.fetch(request).first else { return false }
+                event.note = Self.insertionSiteNote(site)
+                event.isUploadedToNS = false
+                try context.save()
+                debug(.coreData, "Recorded insertion site \(site) on site change at \(event.timestamp ?? Date())")
+                return true
+            } catch {
+                debug(.coreData, "\(DebuggingIdentifiers.failed) failed to record insertion site: \(error)")
+                return false
+            }
+        }
+    }
+
+    static func insertionSiteNote(_ site: String) -> String {
+        "Site: \(site)"
+    }
+
     func getPumpHistory() async throws -> [PumpHistoryEvent] {
         let context = makeContext()
         context.name = "getPumpHistory"
@@ -531,7 +590,7 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
                         enteredBy: NightscoutTreatment.local,
                         bolus: nil,
                         insulin: nil,
-                        notes: nil,
+                        notes: event.note,
                         carbs: nil,
                         fat: nil,
                         protein: nil,

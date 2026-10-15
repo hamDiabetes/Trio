@@ -900,4 +900,100 @@ import Testing
             )))
         }
     }
+
+    // MARK: - Insertion site
+
+    private func podChangeEvent(date: Date) -> LoopKit.NewPumpEvent {
+        LoopKit.NewPumpEvent(
+            date: date,
+            dose: nil,
+            raw: Data("Pod Change \(date)".utf8),
+            title: "Pod Change",
+            type: .replaceComponent(componentType: .pump)
+        )
+    }
+
+    private func siteChangeNotes() async throws -> [String?] {
+        try await storage.getPumpHistoryNotYetUploadedToNightscout()
+            .filter { $0.eventType == .nsSiteChange }
+            .map(\.notes)
+    }
+
+    private func recordSite(_ site: String, podActivatedAt: Date? = nil, retryDelays: [TimeInterval] = []) async {
+        await (storage as! BasePumpHistoryStorage).recordInsertionSite(
+            site,
+            podActivatedAt: podActivatedAt,
+            retryDelays: retryDelays
+        )
+    }
+
+    @Test("A site picked after the pod change lands on it") func testInsertionSiteAfterEvent() async throws {
+        try await storage.storePumpEvents([podChangeEvent(date: Date().addingTimeInterval(-60))], replacePendingEvents: false)
+        try await testContext.perform {
+            let rows = try testContext.fetch(PumpEventStored.fetchRequest())
+            rows.forEach { $0.isUploadedToNS = true }
+            try testContext.save()
+        }
+
+        await recordSite("Left Tummy")
+
+        #expect(try await siteChangeNotes() == ["Site: Left Tummy"])
+    }
+
+    @Test("A site picked while the pod change is still being stored is retried onto it") func testInsertionSiteRetry(
+    ) async throws {
+        let record = Task { await recordSite("Right Arm", retryDelays: [0.5]) }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        try await storage.storePumpEvents([podChangeEvent(date: Date())], replacePendingEvents: false)
+        await record.value
+
+        #expect(try await siteChangeNotes() == ["Site: Right Arm"])
+    }
+
+    @Test("A pod change outside the window is never given a site") func testInsertionSiteWindow() async throws {
+        try await storage.storePumpEvents(
+            [podChangeEvent(date: Date().addingTimeInterval(-31.minutes.timeInterval))],
+            replacePendingEvents: false
+        )
+
+        await recordSite("Left Bum")
+
+        #expect(try await siteChangeNotes() == [nil])
+    }
+
+    @Test("The newest pod change gets the site") func testInsertionSiteNewest() async throws {
+        try await storage.storePumpEvents(
+            [
+                podChangeEvent(date: Date().addingTimeInterval(-10.minutes.timeInterval)),
+                podChangeEvent(date: Date().addingTimeInterval(-2.minutes.timeInterval))
+            ],
+            replacePendingEvents: false
+        )
+
+        await recordSite("Right Leg")
+
+        // newest first
+        #expect(try await siteChangeNotes() == ["Site: Right Leg", nil])
+    }
+
+    @Test("A pod change from before this pod was paired is never given its site") func testInsertionSiteEarlierPod(
+    ) async throws {
+        try await storage.storePumpEvents(
+            [podChangeEvent(date: Date().addingTimeInterval(-10.minutes.timeInterval))],
+            replacePendingEvents: false
+        )
+
+        await recordSite("Left Arm", podActivatedAt: Date().addingTimeInterval(-5.minutes.timeInterval))
+
+        #expect(try await siteChangeNotes() == [nil])
+    }
+
+    @Test("A site already recorded is kept") func testInsertionSiteKept() async throws {
+        try await storage.storePumpEvents([podChangeEvent(date: Date().addingTimeInterval(-60))], replacePendingEvents: false)
+
+        await recordSite("Left Arm")
+        await recordSite("Right Leg")
+
+        #expect(try await siteChangeNotes() == ["Site: Left Arm"])
+    }
 }

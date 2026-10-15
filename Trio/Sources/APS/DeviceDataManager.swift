@@ -201,6 +201,7 @@ final class BaseDeviceDataManager: DeviceDataManager, Injectable {
     @SyncAccess private var lastPumpHeartbeatRequest: PumpHeartbeatRequest?
     @SyncAccess private var cgmProvidesBLEHeartbeat = false
     private var appActiveCancellable: AnyCancellable?
+    private var podSiteCancellable: AnyCancellable?
 
     var bluetoothManager: BluetoothStateManager { bluetoothProvider }
 
@@ -228,6 +229,17 @@ final class BaseDeviceDataManager: DeviceDataManager, Injectable {
                     lastCGMReadingDate: self.glucoseStorage.lastGlucoseDate(),
                     expectedCGMReadingInterval: self.lastPumpHeartbeatRequest?.expectedCGMReadingInterval
                 )
+            }
+
+        podSiteCancellable = Foundation.NotificationCenter.default
+            .publisher(for: PodInsertionSite.selectedNotification)
+            .compactMap { notification -> (String, Date?)? in
+                guard let site = notification.userInfo?[PodInsertionSite.siteKey] as? String else { return nil }
+                return (site, notification.userInfo?[PodInsertionSite.podActivatedAtKey] as? Date)
+            }
+            .sink { [weak self] site, podActivatedAt in
+                guard let self = self else { return }
+                Task { await self.pumpHistoryStorage.recordInsertionSite(site, podActivatedAt: podActivatedAt) }
             }
     }
 
