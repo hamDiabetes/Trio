@@ -51,11 +51,24 @@ enum DosingEngine {
             return true
         }
 
-        if profile.enableSMBHighBg, currentGlucose >= profile.enableSMBHighBgTarget {
+        if profile.enableSMBHighBg,
+           currentGlucose >= highBgSmbTarget(profile: profile, trioCustomOrefVariables: trioCustomOrefVariables)
+        {
             return true
         }
 
         return false
+    }
+
+    /// An active override may lower the Enable SMB With High Glucose target, never raise it.
+    /// It only applies while the global toggle is on, which the caller checks.
+    private static func highBgSmbTarget(profile: Profile, trioCustomOrefVariables: TrioCustomOrefVariables) -> Decimal {
+        guard trioCustomOrefVariables.useOverride, trioCustomOrefVariables.advancedSettings,
+              let overrideTarget = Override.validSmbHighBgTarget(trioCustomOrefVariables.smbHighBgTarget)
+        else {
+            return profile.enableSMBHighBgTarget
+        }
+        return min(profile.enableSMBHighBgTarget, overrideTarget)
     }
 
     /// helper function to check if SMB is scheduled off given the current timezone
@@ -118,6 +131,14 @@ enum DosingEngine {
         // the determineBasal logic always evaluates this logic
         var minGuardGlucoseDecision: Decimal?
         var reason: String?
+
+        let highBgTarget = highBgSmbTarget(profile: profile, trioCustomOrefVariables: trioCustomOrefVariables)
+        if smbIsEnabled, profile.enableSMBHighBg, highBgTarget < profile.enableSMBHighBgTarget,
+           currentGlucose >= highBgTarget
+        {
+            reason = "SMB high BG target \(highBgTarget.jsRounded()) (override), "
+        }
+
         if smbIsEnabled, minGuardGlucose < threshold {
             minGuardGlucoseDecision = minGuardGlucose
             smbIsEnabled = false
@@ -125,7 +146,7 @@ enum DosingEngine {
 
         let maxDeltaGlucoseThreshold = min(profile.maxDeltaBgThreshold, 0.4)
         if glucoseStatus.maxDelta > maxDeltaGlucoseThreshold * currentGlucose {
-            reason =
+            reason = (reason ?? "") +
                 "maxDelta \(glucoseStatus.maxDelta.jsRounded()) > \(100 * maxDeltaGlucoseThreshold)% of BG \(currentGlucose.jsRounded()) - SMB disabled!, "
             smbIsEnabled = false
         }

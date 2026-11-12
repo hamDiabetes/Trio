@@ -178,6 +178,14 @@ extension Adjustments.RootView {
             return "\(smbMinutes.formatted()) min SMB"
         }()
 
+        let smbHighBgString: String = {
+            guard preset.advancedSettings, !preset.smbIsOff, state.isSmbHighBgEnabled,
+                  let highBgTarget = Override.validSmbHighBgTarget(preset.smbHighBgTarget?.decimalValue),
+                  highBgTarget < state.defaultSmbHighBgTarget else { return "" }
+            let shown = state.units == .mgdL ? highBgTarget.description : highBgTarget.formattedAsMmolL
+            return "SMB ≥ \(shown) \(state.units.rawValue)"
+        }()
+
         let maxUamMinsString: String = {
             guard uamMinutes != 0, preset.advancedSettings, !preset.smbIsOff,
                   uamMinutes != state.defaultUamMinutes else { return "" }
@@ -212,7 +220,8 @@ extension Adjustments.RootView {
             targetString,
             smbString,
             maxSmbMinsString,
-            maxUamMinsString
+            maxUamMinsString,
+            smbHighBgString
         ].filter { !$0.isEmpty }
 
         if !name.isEmpty {

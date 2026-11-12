@@ -123,6 +123,7 @@ extension Home.RootView {
 
         var smbMinuteString: String = ""
         var uamMinuteString: String = ""
+        var smbHighBgString: String = ""
 
         if !latestOverride.smbIsOff, latestOverride.advancedSettings {
             if let smbMinutes = latestOverride.smbMinutes,
@@ -138,10 +139,27 @@ extension Home.RootView {
                 uamMinuteString = "UAM\u{00A0}\(uamMinutes)\u{00A0}" +
                     String(localized: "m", comment: "Abbreviation for Minutes")
             }
+
+            if let highBgTarget = Override.validSmbHighBgTarget(latestOverride.smbHighBgTarget?.decimalValue),
+               settingsManager.preferences.enableSMB_high_bg,
+               highBgTarget < settingsManager.preferences.enableSMB_high_bg_target
+            {
+                let shown = unit == .mmolL ? highBgTarget.asMmolL : highBgTarget
+                smbHighBgString = "SMB\u{00A0}≥\u{00A0}" + (fetchedTargetFormatter.string(from: shown as NSNumber) ?? "") +
+                    "\u{00A0}" + unit.rawValue
+            }
         }
 
-        let components = [durationString, percentString, targetString, smbToggleString, smbMinuteString, uamMinuteString]
-            .filter { !$0.isEmpty }
+        let components = [
+            durationString,
+            percentString,
+            targetString,
+            smbToggleString,
+            smbMinuteString,
+            uamMinuteString,
+            smbHighBgString
+        ]
+        .filter { !$0.isEmpty }
         return components.isEmpty ? nil : components.joined(separator: ", ")
     }
 

@@ -21,6 +21,8 @@ struct TrioCustomOrefVariables: JSON, Equatable {
     var end: Decimal
     var smbMinutes: Decimal
     var uamMinutes: Decimal
+    /// Override's Enable SMB With High Glucose target in mg/dL, nil when the override does not set one.
+    var smbHighBgTarget: Decimal?
 
     init(
         average_total_data: Decimal,
@@ -42,7 +44,8 @@ struct TrioCustomOrefVariables: JSON, Equatable {
         start: Decimal,
         end: Decimal,
         smbMinutes: Decimal,
-        uamMinutes: Decimal
+        uamMinutes: Decimal,
+        smbHighBgTarget: Decimal? = nil
     ) {
         self.average_total_data = average_total_data
         self.weightedAverage = weightedAverage
@@ -64,6 +67,7 @@ struct TrioCustomOrefVariables: JSON, Equatable {
         self.end = end
         self.smbMinutes = smbMinutes
         self.uamMinutes = uamMinutes
+        self.smbHighBgTarget = smbHighBgTarget
     }
 }
 
@@ -89,5 +93,6 @@ extension TrioCustomOrefVariables {
         case end
         case smbMinutes
         case uamMinutes
+        case smbHighBgTarget
     }
 }

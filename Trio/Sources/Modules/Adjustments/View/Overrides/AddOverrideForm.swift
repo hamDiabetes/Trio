@@ -16,6 +16,7 @@ struct AddOverrideForm: View {
     @State private var displayPickerTarget: Bool = false
     @State private var displayPickerDisableSmbSchedule: Bool = false
     @State private var displayPickerSmbMinutes: Bool = false
+    @State private var displayPickerSmbHighBg: Bool = false
     @State private var durationHours = 0
     @State private var durationMinutes = 0
     @State private var overrideTarget = false
@@ -330,6 +331,15 @@ struct AddOverrideForm: View {
                             }
                             .listRowSeparator(.hidden, edges: .top)
                         }
+
+                        SmbHighBgTargetPicker(
+                            selection: $state.smbHighBgTarget,
+                            defaultTarget: state.defaultSmbHighBgTarget,
+                            isGlobalEnabled: state.isSmbHighBgEnabled,
+                            units: state.units,
+                            displayPicker: $displayPickerSmbHighBg,
+                            toggleScrollWheel: toggleScrollWheel
+                        )
                     }
                 }
                 .listRowBackground(Color.chart)
@@ -439,6 +449,7 @@ struct AddOverrideForm: View {
         displayPickerTarget = false
         displayPickerDisableSmbSchedule = false
         displayPickerSmbMinutes = false
+        displayPickerSmbHighBg = false
         return !toggle
     }
 

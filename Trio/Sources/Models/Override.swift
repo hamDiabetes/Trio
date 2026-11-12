@@ -21,4 +21,18 @@ struct Override {
     let end: Decimal
     let smbMinutes: Decimal
     let uamMinutes: Decimal
+    /// mg/dL. nil keeps the global Enable SMB With High Glucose target.
+    var smbHighBgTarget: Decimal?
+}
+
+extension Override {
+    static let smbHighBgTargetRange: ClosedRange<Decimal> = 120 ... 200
+    static let smbHighBgTargetOptions =
+        Array(stride(from: smbHighBgTargetRange.lowerBound, through: smbHighBgTargetRange.upperBound, by: 5))
+
+    /// Values outside the range are dropped rather than clamped, so a bad value can never lower the threshold.
+    static func validSmbHighBgTarget(_ value: Decimal?) -> Decimal? {
+        guard let value, smbHighBgTargetRange.contains(value) else { return nil }
+        return value
+    }
 }

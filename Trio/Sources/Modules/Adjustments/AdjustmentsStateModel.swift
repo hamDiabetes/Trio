@@ -41,6 +41,9 @@ extension Adjustments {
         var uamMinutes: Decimal = 0
         var defaultSmbMinutes: Decimal = 0
         var defaultUamMinutes: Decimal = 0
+        var smbHighBgTarget: Decimal?
+        var isSmbHighBgEnabled = false
+        var defaultSmbHighBgTarget: Decimal = 0
         var selectedTab: Tab = .overrides
         var activeOverrideName: String = ""
         var currentActiveOverride: OverrideStored?
@@ -114,6 +117,8 @@ extension Adjustments {
             units = settingsManager.settings.units
             defaultSmbMinutes = settingsManager.preferences.maxSMBBasalMinutes
             defaultUamMinutes = settingsManager.preferences.maxUAMSMBBasalMinutes
+            isSmbHighBgEnabled = settingsManager.preferences.enableSMB_high_bg
+            defaultSmbHighBgTarget = settingsManager.preferences.enableSMB_high_bg_target
             // clamped: drives predicted temp-target percentages, must match the algorithm
             autosensMax = settingsManager.preferences.clamped(for: settingsManager.settings.dosingMode).autosensMax
             settingHalfBasalTarget = settingsManager.preferences.halfBasalExerciseTarget
@@ -231,6 +236,8 @@ extension Adjustments.StateModel: SettingsObserver, PreferencesObserver {
     func preferencesDidChange(_: Preferences) {
         defaultSmbMinutes = settingsManager.preferences.maxSMBBasalMinutes
         defaultUamMinutes = settingsManager.preferences.maxUAMSMBBasalMinutes
+        isSmbHighBgEnabled = settingsManager.preferences.enableSMB_high_bg
+        defaultSmbHighBgTarget = settingsManager.preferences.enableSMB_high_bg_target
         // clamped: drives predicted temp-target percentages, must match the algorithm
         autosensMax = settingsManager.preferences.clamped(for: settingsManager.settings.dosingMode).autosensMax
         settingHalfBasalTarget = settingsManager.preferences.halfBasalExerciseTarget

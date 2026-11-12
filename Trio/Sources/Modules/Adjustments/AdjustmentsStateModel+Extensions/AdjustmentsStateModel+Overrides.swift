@@ -107,7 +107,8 @@ extension Adjustments.StateModel {
                 start: start,
                 end: end,
                 smbMinutes: smbMinutes,
-                uamMinutes: uamMinutes
+                uamMinutes: uamMinutes,
+                smbHighBgTarget: smbHighBgTarget
             )
 
             // First disable all Overrides
@@ -154,7 +155,8 @@ extension Adjustments.StateModel {
                 start: start,
                 end: end,
                 smbMinutes: smbMinutes,
-                uamMinutes: uamMinutes
+                uamMinutes: uamMinutes,
+                smbHighBgTarget: smbHighBgTarget
             )
 
             async let storeOverride: () = overrideStorage.storeOverride(override: preset)
@@ -322,6 +324,7 @@ extension Adjustments.StateModel {
         end = 0
         smbMinutes = defaultSmbMinutes
         uamMinutes = defaultUamMinutes
+        smbHighBgTarget = nil
         target = currentGlucoseTarget
     }
 

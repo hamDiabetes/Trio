@@ -1109,6 +1109,17 @@ extension SettingsExport {
                                             unit: String(localized: "minutes")
                                         ))
                                     }
+                                    if let smbHighBgTarget = preset.smbHighBgTarget {
+                                        processedOverridePresets.append(.init(
+                                            category: category,
+                                            subcategory: presetName,
+                                            name: "SMB With High Glucose Target",
+                                            value: trioSettings.units == .mgdL
+                                                ? smbHighBgTarget.description
+                                                : smbHighBgTarget.decimalValue.formattedAsMmolL,
+                                            unit: trioSettings.units.rawValue
+                                        ))
+                                    }
                                 }
 
                                 if preset.smbIsOff {

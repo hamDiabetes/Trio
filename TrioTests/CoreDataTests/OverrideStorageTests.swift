@@ -86,6 +86,125 @@ import Testing
         #expect(storedOverride?.isPreset == false, "isPreset should match")
     }
 
+    @Test("Store SMB with high glucose target, dropping out-of-range values") func testStoreSmbHighBgTarget() async throws {
+        func makeOverride(name: String, advancedSettings: Bool, smbHighBgTarget: Decimal?) -> Override {
+            Override(
+                name: name,
+                enabled: false,
+                date: Date(),
+                duration: 0,
+                indefinite: true,
+                percentage: 100,
+                smbIsOff: false,
+                isPreset: true,
+                id: UUID().uuidString,
+                overrideTarget: false,
+                target: 0,
+                advancedSettings: advancedSettings,
+                isfAndCr: false,
+                isf: false,
+                cr: false,
+                smbIsScheduledOff: false,
+                start: 0,
+                end: 0,
+                smbMinutes: 30,
+                uamMinutes: 120,
+                smbHighBgTarget: smbHighBgTarget
+            )
+        }
+
+        let cases: [(String, Bool, Decimal?, Decimal?)] = [
+            ("HighBg Valid", true, 150, 150),
+            ("HighBg Unset", true, nil, nil),
+            ("HighBg Too Low", true, 90, nil),
+            ("HighBg Too High", true, 260, nil),
+            ("HighBg 119", true, 119, nil),
+            ("HighBg 120", true, 120, 120),
+            ("HighBg 200", true, 200, 200),
+            ("HighBg 201", true, 201, nil),
+            ("HighBg No Advanced", false, 150, nil)
+        ]
+
+        for (name, advancedSettings, input, expected) in cases {
+            try await storage.storeOverride(
+                override: makeOverride(name: name, advancedSettings: advancedSettings, smbHighBgTarget: input)
+            )
+            let stored = try await coreDataStack.fetchEntitiesAsync(
+                ofType: OverrideStored.self,
+                onContext: testContext,
+                predicate: NSPredicate(format: "name == %@", name),
+                key: "date",
+                ascending: false
+            ) as? [OverrideStored]
+            let value = await testContext.perform { stored?.first?.smbHighBgTarget?.decimalValue }
+            #expect(stored?.count == 1, "\(name) should be stored once")
+            #expect(value == expected, "\(name) should store \(String(describing: expected))")
+        }
+    }
+
+    @Test(
+        "Copying a running override keeps the SMB with high glucose target"
+    ) @MainActor func testCopyRunningOverrideSmbHighBgTarget(
+    ) async throws {
+        let source = OverrideStored(context: testContext)
+        source.id = UUID().uuidString
+        source.name = "Copy Source"
+        source.date = Date()
+        source.advancedSettings = true
+        source.smbHighBgTarget = 150
+
+        let copyID = await storage.copyRunningOverride(source)
+        let viewContext = CoreDataStack.shared.persistentContainer.viewContext
+        let copy = try viewContext.existingObject(with: copyID) as? OverrideStored
+        #expect(copy?.smbHighBgTarget?.decimalValue == 150)
+        #expect(copy?.advancedSettings == true)
+
+        if let copy {
+            viewContext.delete(copy)
+            try viewContext.save()
+        }
+        testContext.delete(source)
+    }
+
+    @Test("Algorithm input carries the active override's SMB with high glucose target") func testOrefVariablesSmbHighBgTarget(
+    ) async throws {
+        try await testContext.perform {
+            let active = OverrideStored(context: self.testContext)
+            active.id = UUID().uuidString
+            active.name = "Active Meal"
+            active.date = Date()
+            active.enabled = true
+            active.indefinite = true
+            active.percentage = 100
+            active.advancedSettings = true
+            active.smbMinutes = 30
+            active.uamMinutes = 120
+            active.smbHighBgTarget = 150
+            try self.testContext.save()
+        }
+
+        let openAPS = OpenAPS(
+            storage: BaseFileStorage(),
+            tddStorage: resolver.resolve(TDDStorage.self)!,
+            glucoseStorage: resolver.resolve(GlucoseStorage.self)!,
+            carbsStorage: resolver.resolve(CarbsStorage.self)!
+        )
+        let raw = try await openAPS.prepareTrioCustomOrefVariables(on: testContext)
+        let variables = try JSONCoding.decoder.decode(TrioCustomOrefVariables.self, from: Data(raw.utf8))
+
+        #expect(variables.useOverride == true)
+        #expect(variables.advancedSettings == true)
+        #expect(variables.uamMinutes == 120)
+        #expect(variables.smbHighBgTarget == 150)
+
+        try await testContext.perform {
+            let request = OverrideStored.fetchRequest()
+            request.predicate = NSPredicate(format: "name == %@", "Active Meal")
+            try self.testContext.fetch(request).forEach { self.testContext.delete($0) }
+            try self.testContext.save()
+        }
+    }
+
     @Test("Store and retrieve override preset") func testStoreAndRetrieveOverridePreset() async throws {
         // Given
         let testPreset = Override(

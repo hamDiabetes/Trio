@@ -23,6 +23,7 @@ struct EditOverrideForm: View {
     @State private var cr: Bool
     @State private var smbMinutes: Decimal?
     @State private var uamMinutes: Decimal?
+    @State private var smbHighBgTarget: Decimal?
     @State private var selectedIsfCrOption: IsfAndOrCrOptions
     @State private var selectedDisableSmbOption: DisableSmbOptions
     @State private var hasChanges = false
@@ -35,6 +36,7 @@ struct EditOverrideForm: View {
     @State private var displayPickerTarget: Bool = false
     @State private var displayPickerDisableSmbSchedule: Bool = false
     @State private var displayPickerSmbMinutes: Bool = false
+    @State private var displayPickerSmbHighBg: Bool = false
 
     init(overrideToEdit: OverrideStored, state: Adjustments.StateModel) {
         override = overrideToEdit
@@ -63,6 +65,7 @@ struct EditOverrideForm: View {
         )
         _smbMinutes = State(initialValue: overrideToEdit.smbMinutes?.decimalValue)
         _uamMinutes = State(initialValue: overrideToEdit.uamMinutes?.decimalValue)
+        _smbHighBgTarget = State(initialValue: overrideToEdit.smbHighBgTarget?.decimalValue)
     }
 
     private var percentageSelection: Binding<Double> {
@@ -428,6 +431,16 @@ struct EditOverrideForm: View {
                             }
                             .listRowSeparator(.hidden, edges: .top)
                         }
+
+                        SmbHighBgTargetPicker(
+                            selection: $smbHighBgTarget,
+                            defaultTarget: state.defaultSmbHighBgTarget,
+                            isGlobalEnabled: state.isSmbHighBgEnabled,
+                            units: state.units,
+                            displayPicker: $displayPickerSmbHighBg,
+                            toggleScrollWheel: toggleScrollWheel
+                        )
+                        .onChange(of: smbHighBgTarget) { hasChanges = true }
                     }
                 }
                 .listRowBackground(Color.chart)
@@ -596,6 +609,9 @@ struct EditOverrideForm: View {
         override.cr = cr
         override.smbMinutes = smbMinutes.map { NSDecimalNumber(decimal: $0) }
         override.uamMinutes = uamMinutes.map { NSDecimalNumber(decimal: $0) }
+        override.smbHighBgTarget = advancedSettings
+            ? Override.validSmbHighBgTarget(smbHighBgTarget).map { NSDecimalNumber(decimal: $0) }
+            : nil
         override.isUploadedToNS = false
     }
 
@@ -615,6 +631,7 @@ struct EditOverrideForm: View {
         cr = override.cr
         smbMinutes = override.smbMinutes?.decimalValue ?? state.defaultSmbMinutes
         uamMinutes = override.uamMinutes?.decimalValue ?? state.defaultUamMinutes
+        smbHighBgTarget = override.smbHighBgTarget?.decimalValue
     }
 
     private func toggleScrollWheel(_ toggle: Bool) -> Bool {
@@ -623,6 +640,7 @@ struct EditOverrideForm: View {
         displayPickerTarget = false
         displayPickerDisableSmbSchedule = false
         displayPickerSmbMinutes = false
+        displayPickerSmbHighBg = false
         return !toggle
     }
 }

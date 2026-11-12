@@ -417,4 +417,177 @@ import Testing
         )
         #expect(decision.isEnabled == true)
     }
+
+    // MARK: - Override SMB With High Glucose Target
+
+    /// Global Enable SMB With High Glucose on at 180, with an active advanced-settings override.
+    private func highBgInputs(overrideTarget: Decimal?, glucose: Decimal) -> (
+        profile: Profile,
+        meal: ComputedCarbs,
+        currentGlucose: Decimal,
+        adjustedTargetGlucose: Decimal,
+        minGuardGlucose: Decimal,
+        threshold: Decimal,
+        glucoseStatus: GlucoseStatus,
+        trioCustomOrefVariables: TrioCustomOrefVariables,
+        clock: Date
+    ) {
+        var inputs = createDefaultInputs()
+        inputs.profile.enableSMBHighBg = true
+        inputs.profile.enableSMBHighBgTarget = 180
+        inputs.trioCustomOrefVariables.useOverride = true
+        inputs.trioCustomOrefVariables.advancedSettings = true
+        inputs.trioCustomOrefVariables.smbHighBgTarget = overrideTarget
+        inputs.currentGlucose = glucose
+        inputs.minGuardGlucose = glucose
+        return inputs
+    }
+
+    private func decide(_ inputs: (
+        profile: Profile,
+        meal: ComputedCarbs,
+        currentGlucose: Decimal,
+        adjustedTargetGlucose: Decimal,
+        minGuardGlucose: Decimal,
+        threshold: Decimal,
+        glucoseStatus: GlucoseStatus,
+        trioCustomOrefVariables: TrioCustomOrefVariables,
+        clock: Date
+    )) throws -> DosingEngine.SMBDecision {
+        try DosingEngine.makeSMBDosingDecision(
+            profile: inputs.profile, meal: inputs.meal, currentGlucose: inputs.currentGlucose,
+            adjustedTargetGlucose: inputs.adjustedTargetGlucose,
+            minGuardGlucose: inputs.minGuardGlucose,
+            threshold: inputs.threshold, glucoseStatus: inputs.glucoseStatus,
+            trioCustomOrefVariables: inputs.trioCustomOrefVariables, clock: inputs.clock
+        )
+    }
+
+    @Test("Override high BG target 150 enables SMB at BG 160") func overrideHighBgTargetEnables() throws {
+        #expect(try decide(highBgInputs(overrideTarget: 150, glucose: 160)).isEnabled == true)
+    }
+
+    @Test("Override high BG target 150 enables SMB at exactly BG 150") func overrideHighBgTargetInclusive() throws {
+        #expect(try decide(highBgInputs(overrideTarget: 150, glucose: 150)).isEnabled == true)
+    }
+
+    @Test("No override high BG target keeps the global 180") func overrideHighBgTargetNil() throws {
+        #expect(try decide(highBgInputs(overrideTarget: nil, glucose: 160)).isEnabled == false)
+        #expect(try decide(highBgInputs(overrideTarget: nil, glucose: 180)).isEnabled == true)
+    }
+
+    @Test("Override high BG target 150 does not enable SMB at BG 140") func overrideHighBgTargetBelow() throws {
+        #expect(try decide(highBgInputs(overrideTarget: 150, glucose: 140)).isEnabled == false)
+    }
+
+    @Test("smbIsOff wins over override high BG target") func overrideHighBgTargetSmbIsOff() throws {
+        var inputs = highBgInputs(overrideTarget: 150, glucose: 160)
+        inputs.trioCustomOrefVariables.smbIsOff = true
+        #expect(try decide(inputs).isEnabled == false)
+    }
+
+    @Test("Override high BG target has no effect with the global toggle off") func overrideHighBgTargetGlobalOff() throws {
+        var inputs = highBgInputs(overrideTarget: 150, glucose: 160)
+        inputs.profile.enableSMBHighBg = false
+        #expect(try decide(inputs).isEnabled == false)
+    }
+
+    @Test("Override high BG target needs an active override with advanced settings") func overrideHighBgTargetInactive() throws {
+        var inactive = highBgInputs(overrideTarget: 150, glucose: 160)
+        inactive.trioCustomOrefVariables.useOverride = false
+        #expect(try decide(inactive).isEnabled == false)
+
+        var noAdvanced = highBgInputs(overrideTarget: 150, glucose: 160)
+        noAdvanced.trioCustomOrefVariables.advancedSettings = false
+        #expect(try decide(noAdvanced).isEnabled == false)
+    }
+
+    @Test("Override high BG target cannot raise the global target") func overrideHighBgTargetNeverRaises() throws {
+        #expect(try decide(highBgInputs(overrideTarget: 200, glucose: 185)).isEnabled == true)
+    }
+
+    @Test("Out-of-range override high BG target is ignored") func overrideHighBgTargetOutOfRange() throws {
+        #expect(try decide(highBgInputs(overrideTarget: 100, glucose: 110)).isEnabled == false)
+        #expect(try decide(highBgInputs(overrideTarget: 115, glucose: 160)).isEnabled == false)
+    }
+
+    @Test("Scheduled off and high temp target still win over override high BG target") func overrideHighBgTargetOtherDisables(
+    ) throws {
+        var scheduled = highBgInputs(overrideTarget: 150, glucose: 160)
+        scheduled.trioCustomOrefVariables.smbIsScheduledOff = true
+        scheduled.trioCustomOrefVariables.start = 0
+        scheduled.trioCustomOrefVariables.end = 0
+        #expect(try decide(scheduled).isEnabled == false)
+
+        var highTempTarget = highBgInputs(overrideTarget: 150, glucose: 160)
+        highTempTarget.profile.allowSMBWithHighTemptarget = false
+        highTempTarget.profile.temptargetSet = true
+        highTempTarget.adjustedTargetGlucose = 120
+        #expect(try decide(highTempTarget).isEnabled == false)
+    }
+
+    @Test("minGuard and maxDelta still disable with override high BG target") func overrideHighBgTargetGuards() throws {
+        var lowGuard = highBgInputs(overrideTarget: 150, glucose: 160)
+        lowGuard.minGuardGlucose = 65
+        let guardDecision = try decide(lowGuard)
+        #expect(guardDecision.isEnabled == false)
+        #expect(guardDecision.minGuardGlucose == 65)
+
+        var fastRise = highBgInputs(overrideTarget: 150, glucose: 160)
+        fastRise.profile.maxDeltaBgThreshold = 0.2
+        fastRise.glucoseStatus = GlucoseStatus(
+            delta: 40, glucose: 160, noise: 0, shortAvgDelta: 5, longAvgDelta: 5,
+            date: Date(), lastCalIndex: nil, device: "test"
+        )
+        #expect(try decide(fastRise).isEnabled == false)
+    }
+
+    @Test("Override high BG target range bounds are 120 and 200 inclusive") func overrideHighBgTargetBounds() throws {
+        #expect(Override.validSmbHighBgTarget(119) == nil)
+        #expect(Override.validSmbHighBgTarget(120) == 120)
+        #expect(Override.validSmbHighBgTarget(200) == 200)
+        #expect(Override.validSmbHighBgTarget(201) == nil)
+
+        #expect(try decide(highBgInputs(overrideTarget: 119, glucose: 150)).isEnabled == false)
+        #expect(try decide(highBgInputs(overrideTarget: 120, glucose: 125)).isEnabled == true)
+
+        var at200 = highBgInputs(overrideTarget: 200, glucose: 205)
+        at200.profile.enableSMBHighBgTarget = 210
+        #expect(try decide(at200).isEnabled == true)
+
+        var at201 = highBgInputs(overrideTarget: 201, glucose: 205)
+        at201.profile.enableSMBHighBgTarget = 210
+        #expect(try decide(at201).isEnabled == false)
+    }
+
+    @Test("Global target below the override wins") func overrideHighBgTargetGlobalLower() throws {
+        var inputs = highBgInputs(overrideTarget: 150, glucose: 145)
+        inputs.profile.enableSMBHighBgTarget = 140
+        let decision = try decide(inputs)
+        #expect(decision.isEnabled == true)
+        #expect(decision.reason == nil)
+    }
+
+    @Test("Reason names the override high BG target only when it lowered the target") func overrideHighBgTargetReason() throws {
+        #expect(try decide(highBgInputs(overrideTarget: 150, glucose: 160)).reason == "SMB high BG target 150 (override), ")
+        #expect(try decide(highBgInputs(overrideTarget: nil, glucose: 185)).reason == nil)
+        #expect(try decide(highBgInputs(overrideTarget: 150, glucose: 140)).reason == nil)
+
+        var smbOff = highBgInputs(overrideTarget: 150, glucose: 160)
+        smbOff.trioCustomOrefVariables.smbIsOff = true
+        #expect(try decide(smbOff).reason == nil)
+    }
+
+    @Test("Unset override high BG target leaves the oref variables JSON unchanged") func overrideHighBgTargetJsonUnchanged() throws {
+        var unset = createDefaultInputs().trioCustomOrefVariables
+        unset.date = Date(timeIntervalSince1970: 1_700_000_000)
+        let json = String(data: try JSONCoding.encoder.encode(unset), encoding: .utf8) ?? ""
+        #expect(!json.contains("smbHighBgTarget"))
+
+        var set = unset
+        set.smbHighBgTarget = 150
+        let decoded = try JSONCoding.decoder.decode(TrioCustomOrefVariables.self, from: JSONCoding.encoder.encode(set))
+        #expect(decoded.smbHighBgTarget == 150)
+        #expect(try JSONCoding.decoder.decode(TrioCustomOrefVariables.self, from: Data(json.utf8)) == unset)
+    }
 }

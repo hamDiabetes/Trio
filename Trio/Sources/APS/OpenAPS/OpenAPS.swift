@@ -434,7 +434,8 @@ final class OpenAPS {
                 start: (activeOverrides.first?.start ?? 0) as Decimal,
                 end: (activeOverrides.first?.end ?? 0) as Decimal,
                 smbMinutes: activeOverrides.first?.smbMinutes?.decimalValue ?? maxSMBBasalMinutes,
-                uamMinutes: activeOverrides.first?.uamMinutes?.decimalValue ?? maxUAMBasalMinutes
+                uamMinutes: activeOverrides.first?.uamMinutes?.decimalValue ?? maxUAMBasalMinutes,
+                smbHighBgTarget: activeOverrides.first?.smbHighBgTarget?.decimalValue
             )
 
             // Save and return contents of Trio's custom oref variables

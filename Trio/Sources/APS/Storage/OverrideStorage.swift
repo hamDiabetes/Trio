@@ -165,6 +165,8 @@ final class BaseOverrideStorage: @preconcurrency OverrideStorage, Injectable {
 
                 newOverride.smbMinutes = override.smbMinutes as NSDecimalNumber
                 newOverride.uamMinutes = override.uamMinutes as NSDecimalNumber
+                newOverride.smbHighBgTarget = Override.validSmbHighBgTarget(override.smbHighBgTarget)
+                    .map { $0 as NSDecimalNumber }
             }
 
             if override.smbIsScheduledOff {
@@ -207,6 +209,7 @@ final class BaseOverrideStorage: @preconcurrency OverrideStorage, Injectable {
         newOverride.end = override.end
         newOverride.smbMinutes = override.smbMinutes
         newOverride.uamMinutes = override.uamMinutes
+        newOverride.smbHighBgTarget = override.smbHighBgTarget
         newOverride.isUploadedToNS = true // set to true to avoid getting duplicate entries on NS
 
         await viewContext.perform {
